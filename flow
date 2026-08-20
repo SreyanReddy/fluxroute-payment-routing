@@ -1,0 +1,35 @@
+Phase 1 — Feature-serving design (start here)
+
+Before writing any service code, nail down exactly how each of the 26 model features gets computed live, matching the offline feature_extraction3.py/engineer_features() formulas precisely. This is the highest-risk step — it's the exact kind of train/serve mismatch we just spent real effort catching (route_utilization, time_since_last_failure). Get this wrong and the model silently degrades in production with no error to catch it. Output: a written spec mapping each feature → Redis data structure + update rule + read-time formula.
+
+Phase 2 — Redis schema + feature computation module
+
+Implement the actual data structures (rolling counters, sorted sets/sliding windows for the 5m/15m windows, hashes for static per-route config) and a small module that assembles the full feature vector for a (transaction, candidate route) pair at request time, using Phase 1's spec.
+
+Phase 3 — FastAPI routing service
+
+Two things: a routing endpoint (score all eligible candidate routes, argmax, return the choice) and an outcome-recording mechanism (update Redis after each transaction resolves — success/failure, latency). The second piece matters more than it sounds: once this exists, the deployed system is a real closed loop, which is exactly the thing we flagged as future-work when it was only an offline concern.
+
+Phase 4 — Local end-to-end test
+
+Hit the real service with a handful of manual requests against real Redis before scaling anything up. Cheap, catches integration bugs early.
+
+Phase 5 — Containerize
+
+Dockerfile for the service, docker-compose bringing up service + Redis together.
+
+Phase 6 — Replicas + load balancer
+
+Scale the (stateless) service to multiple replicas sharing the same Redis backend, fronted by nginx or similar.
+
+Phase 7 — Load testing
+
+Locust or k6 against the deployed, replicated service — this produces the actual resume-worthy p99 latency/throughput numbers. Worth picking a realistic test load for your setup, not the 100k-tps figure from the simulator — that was a data-generation assumption, not a target for your actual infra.
+
+Phase 8 — Monitoring
+
+Prometheus/Grafana, or at minimum structured logging plus a simple dashboard — latency, route-selection distribution, error rates.
+
+Phase 9 (separate track, later) — CacheX swap-in
+
+Once CacheX's swap-ready command set works, point the service at it instead of real Redis and re-run the exact same load test suite to get the "from-scratch cache vs. production Redis" comparison chart from your original project plan.
