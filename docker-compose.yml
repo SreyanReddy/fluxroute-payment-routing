@@ -1,0 +1,86 @@
+x-app: &app
+  build:
+    context: .
+    dockerfile: serving/Dockerfile
+  environment:
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app1:
+    <<: *app
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      INSTANCE_ID: app1
+      TRAFFIC_SCALE: ${TRAFFIC_SCALE:-800}
+
+  app2:
+    <<: *app
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      INSTANCE_ID: app2
+      TRAFFIC_SCALE: ${TRAFFIC_SCALE:-800}
+
+  app3:
+    <<: *app
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      INSTANCE_ID: app3
+      TRAFFIC_SCALE: ${TRAFFIC_SCALE:-800}
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - app1
+      - app2
+      - app3
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - app1
+      - app2
+      - app3
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./deploy/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped

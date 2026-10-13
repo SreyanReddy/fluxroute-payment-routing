@@ -34,3 +34,7 @@ Thumbs.db
 .claude/
 
 dataset-generator-routing/*.csv
+
+tests/parity/.cache/
+
+.venv-load/

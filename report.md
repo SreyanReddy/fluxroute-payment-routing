@@ -858,3 +858,486 @@ the calibration problem it would have targeted.
 ML pipeline: closed. Moving to deployment — FastAPI service, Redis
 integration, containerization, load testing.
 
+
+## 15. Deployment
+
+### 15.1 Architecture
+
+Stateless FastAPI service, three replicas behind nginx (`least_conn`, keepalive
+to upstreams), all sharing one Redis instance that holds every piece of mutable
+state. Prometheus scrapes all three instances; Grafana provisions a dashboard
+from `deploy/grafana/`.
+
+```
+nginx :8080  ->  app1 / app2 / app3 (uvicorn)  ->  Redis
+                          |
+                     /metrics  ->  Prometheus :9090  ->  Grafana :3000
+```
+
+Files: `serving/main.py`, `serving/feature_storing.py`, `serving/Dockerfile`,
+`docker-compose.yml`, `deploy/nginx.conf`, `deploy/prometheus.yml`,
+`deploy/grafana/`, `loadtest/locustfile.py`.
+
+### 15.2 Feature parity mechanism
+
+`serving/feature_storing.py` mirrors the offline formulas in
+`feature_extraction3.py` and `engineer_features()` on three Redis primitives:
+
+1. **Minute-bucketed counters** (`{scope}:{metric}:{epoch_minute}`, TTL 1800s)
+   for every rolling-window feature, at route / bank / network / bank×route /
+   global scope. Reads sum buckets `[now-N, now-1]`, **excluding the current
+   minute**, matching `prior_rolling_sum()`'s convention exactly.
+2. **Last-event-minute keys** for `time_since_last_failure` (keyed on the
+   observable 5m success rate crossing `FLAG_DOWN_THRESHOLD`, per the
+   deployability fix in Section 10) and `time_since_last_bank_route_success`.
+3. **Cumulative sum/count** for `amount_to_bank_avg_ratio`, read before the
+   current transaction is incorporated, matching the offline
+   `cumsum().shift(1)`.
+
+`main.py` reads the feature list from the model artifact itself
+(`artifact["numeric_features"] + artifact["categorical_features"]`) rather than
+importing `ml/lightgbm_tuned.py`. This removes the training code from the
+serving container entirely and makes it structurally impossible for the serving
+feature list to drift from what the model was actually fitted on. All 33 columns
+(26 numeric + 7 categorical) are produced by `build_route_features()`.
+
+### 15.3 Bug found: in-flight transactions counted as failures
+
+The first version of `get_rolling_rate()` computed success rate as
+`successes / requests`. But the two counters are written at different points in
+the transaction lifecycle: `req` increments when the routing decision is made,
+`succ` only when `/outcome` arrives. Every transaction still in flight was
+therefore being counted as a failure.
+
+Offline this bias does not exist — `feature_extraction3.py` computes rates over
+completed minutes where every outcome is already known. So this was genuine
+train/serve skew, and it gets *worse* under load, since higher throughput means
+more concurrently in-flight transactions.
+
+The observable symptom during manual testing was all four candidate routes
+returning identical predicted probabilities: with success rates artificially
+depressed toward zero across every route, the routes became indistinguishable
+in feature space and their raw scores collapsed into the same isotonic
+calibration step.
+
+Fixed by adding a separate `resolved` counter incremented on outcome arrival,
+and using it as the denominator for success rate, average latency, and the
+bank×route shrunk rate. `req` remains the denominator for utilization and
+`system_tps`, which correctly should count all arriving requests regardless of
+whether they have resolved.
+
+### 15.4 Two smaller correctness notes
+
+- **Prometheus and uvicorn workers**: `prometheus_client` keeps a per-process
+  registry, so running multiple uvicorn workers per container would mean each
+  scrape hits one arbitrary worker and returns partial counters. Containers run
+  a single worker; concurrency comes from replicas instead, which keeps
+  per-instance metrics exact and the scaling story simple.
+- **Ranking uses raw, not calibrated, probabilities.** Isotonic regression is a
+  step function, and in the 0.9+ region where nearly all traffic sits its steps
+  are wide enough to map genuinely different routes onto an identical calibrated
+  value — at which point `idxmax()` silently degenerates into "first row wins".
+  Raw scores retain full resolution, so ranking uses them; the calibrated value
+  is still what gets reported to the caller, since that is the number with a
+  meaningful absolute interpretation.
+
+Note that the Section 14.3 action item about overwriting `artifact["threshold"]`
+is moot for the current design: `/route` performs pure argmax over candidates
+and never reads a threshold. It would become relevant only if a circuit-breaker
+gate is added later.
+
+### 15.5 Load testing
+
+`loadtest/locustfile.py` samples transactions from the same distributions as
+`transactions.py`, calls `/route`, then reports a simulated outcome back to
+`/outcome` — driving the real feedback loop rather than hammering a read-only
+endpoint, so route health actually evolves under load. `/route` and `/outcome`
+are reported as separate Locust request types.
+
+The Grafana dashboard separates **Redis feature-fetch latency** from **model
+scoring latency** as distinct histograms. This is deliberate: it identifies
+which half of the request path dominates p99, and establishes the baseline the
+CacheX comparison will be measured against.
+
+**Status: harness and full stack built; no load-test run has been recorded yet.**
+p99 latency and throughput figures are deliberately absent from the README until
+an actual run produces them.
+
+
+## 16. Environment Recovery and Serving Audit
+
+Work resumed after a ~6-week break. Before planning anything, the state of the
+workspace was checked from scratch rather than assumed.
+
+### 16.1 What was found
+
+| Finding | Detail | Consequence |
+|---|---|---|
+| Virtual environment broken | `.venv/bin/python3 -> 'unsupported reparse tag 0xa000000c'`. The project lives on an NTFS mount (`/media/sreyan/D/`), which mangled the interpreter symlink into a Windows reparse point. `site-packages` was intact. | No Python could run. |
+| Feature CSV missing | `payment_dataset_features_4week_v2.csv` was gone; only `payment_dataset_actual_4week_v2.csv` and `route_metrics_4week_v2.csv` survived. | Couldn't evaluate or test against training data. |
+| Docker not installed | `docker: command not found`. | The deployment stack had never run. |
+| The recorded load test measured nothing | `loadtest/run1_failures.csv`: 53,631 occurrences of `status=0`, all requests, 2026-09-07 18:58:33Z to 19:00:55Z. `status=0` is a refused connection, not an HTTP error. | The 377 req/s and 2 ms median in `run1_stats.csv` are how fast the kernel refuses connections. No signal; discarded. |
+
+### 16.2 Fixes
+
+- **New environment** at `~/.venvs/fluxroute`, on the ext4 home directory so
+  NTFS can't corrupt it again. Built with `python3.10` specifically, since that's
+  what the model was pickled under, and installed from all three requirement
+  files (root, `serving/`, `loadtest/`).
+- **Feature CSV regenerated** by re-running `feature_extraction3.py` on the two
+  surviving inputs. The path has no randomness, so the output is reproducible.
+  Verified against the final training run rather than assumed:
+
+| | Regenerated | Final training run |
+|---|---|---|
+| Test rows | 165,857 | 165,857 |
+| Train + validation rows | 496,521 | 397,216 + 99,305 = 496,521 |
+
+  Total 662,378 rows, 28 columns, 40,320 minutes. The model artifact remains
+  valid, so no retraining was needed. v1 data was not regenerated: its numbers
+  are already recorded in this report and nothing downstream uses it.
+
+### 16.3 The serving spec, and verifying it
+
+`FEATURE_SERVING_SPEC.md` was written during the break. It's a precise contract
+for how each of the 26 numeric features must be computed live, and it's
+considerably more rigorous than the original Phase 1 design. Several of its
+values could be checked directly against the regenerated training data. All
+eight route constants it quotes matched exactly, and the serving code's
+hardcoded values did not:
+
+| Route | `route_base_success_rate` training / hardcoded | `route_base_latency_ms` training / hardcoded |
+|---|---|---|
+| R1 | 0.97016 / 0.986 | 168.53 / 145 |
+| R2 | 0.95612 / 0.981 | 116.12 / 85 |
+| R3 | 0.96275 / 0.979 | 130.18 / 110 |
+| R4 | 0.94450 / 0.983 | **283.69 / 175** (62% off) |
+
+The serving code had typed in the simulator's *nominal* settings. Training
+recorded the *observed* means, which are lower for success and higher for
+latency because they include incidents and congestion. The model learned the
+observed values. This was real train/serve skew, and it was silent.
+
+### 16.4 Minor: the artifact's stored threshold
+
+`models/lightgbm_tuned_v2.joblib` stores `threshold = 0.12069`, which is the
+target-recall value from `analyze_thresholds()`, the one Section 14.2 showed to
+be fragile. `ml/save_artifact.py` (which sets 0.18) was overwritten by a later
+retrain. This is harmless today, because `/route` does pure argmax and never
+reads a threshold. It should still be corrected so the artifact doesn't carry a
+misleading number.
+
+
+## 17. The `system_tps` Scale Problem
+
+### 17.1 What the imputer revealed
+
+The fitted median imputer stores the training median of every numeric feature:
+
+| Feature | Training median |
+|---|---|
+| `route_success_rate_5m` | 0.98101 |
+| `route_avg_latency_5m` | 145.0 |
+| `route_utilization` | 0.34998 |
+| `system_tps` | **160,169** |
+
+`system_tps` was trained on the simulator's production-scale stream (base
+100,000 TPS times the time-of-day curve). A live service can only measure its
+own traffic, a few hundred requests per second under a load test. That's three
+orders of magnitude outside anything the model saw, and `route_utilization` and
+`route_stress` are derived from it.
+
+### 17.2 What the model does with an out-of-range value
+
+Tree models don't extrapolate. Every split is a threshold like
+"`system_tps` < 45,000?", and 200 falls below all of them, so the model treats it
+exactly like the smallest training value. The effect is a consistent bias, not
+random noise: **the model always believes it is the quietest night it has ever
+seen**, and therefore that every route is lightly loaded.
+
+### 17.3 Decision: scale the live meter (implemented, see 17.4)
+
+Treat the service's traffic as a sample of a larger production stream and
+multiply by a configured ratio:
+
+```
+system_tps = (requests in the last 60 completed seconds / 60) x SCALE
+```
+
+The dataset's own sampling ratio is 1 row per 400,000 production transactions
+(15 sampled rows per minute out of 6,000,000). That ratio only holds if requests
+arrive at the dataset's natural rate (~0.25/s). A load test runs about 1,000x
+faster, so 400,000 would push the value far above the training range instead of
+below it. The practical rule is:
+
+```
+SCALE = training median / planned test rate      e.g. 160,169 / 200 ~ 800
+```
+
+SCALE is a configuration value, not a constant. The result is clamped to the
+training range, which `models/serving_constants_v2.json` now records as **8,458
+to 308,555** (median 162,978 over all training rows; the imputer's 160,169 was fit
+on the training part without the validation tail).
+
+`route_utilization` changes at the same time to the spec's formula,
+`system_tps x frozen_routing_share[r] / base_capacity_tps[r]`, using the training
+shares R1 0.35, R2 0.25, R3 0.25, R4 0.15, instead of each route's observed
+traffic.
+
+**Remaining limitation, documented rather than hidden:** in training,
+`system_tps` and `hour_of_day` moved together, since both came from one
+time-of-day curve. A flat load test produces combinations the model rarely saw
+(midday traffic at 3am). The principled long-term fix is to retrain, either
+without these features or with the live-meter definition.
+
+### 17.4 Implementation
+
+- **Meter** (`serving/feature_storing.py`): `record_ingress()` increments
+  `fr:ingress:sec:{second}` (TTL 120 s) for every `/route` request.
+  `read_system_tps()` sums the last 60 completed seconds, so the current second
+  and the request itself are excluded, then divides by 60, multiplies by
+  `TRAFFIC_SCALE`, and clamps to the training range from
+  `serving_constants_v2.json`. It returns the reading and a clamp direction
+  (`low` / `high` / none).
+- **Once per request** (`serving/main.py`): the meter is read once and the value
+  is passed into `build_route_features(..., system_tps=...)`, so every candidate
+  route sees the same reading. The old per-minute `global:req` counter was
+  removed; the ingress counter replaces it at the same cost.
+- **Utilization**: `system_tps × routing_share / base_capacity_tps`, with shares
+  and capacities from the constants file.
+- **Configuration**: `TRAFFIC_SCALE` defaults to 1.0 in code;
+  `docker-compose.yml` sets `${TRAFFIC_SCALE:-800}` (800 suits a ~200 req/s
+  test), overridable per run from the shell.
+- **Observability**: gauge `fluxroute_system_tps` (the reading passed to the
+  model) and counter `fluxroute_system_tps_clamped_total{direction}`.
+- **Clock**: `current_minute()` is now derived from `current_second()`, so tests
+  freeze one function and both stay consistent.
+
+Verification:
+
+| Check | Result |
+|---|---|
+| `tests/traffic_meter_check.py` (SCALE 800) | 5 req/s clamped to 8,458 (low); 20 to 16,000; 200 to 160,000; 350 to 280,000; 500 clamped to 308,555 (high). A million requests in the current second are ignored. All pass. |
+| Parity test (replay at SCALE 1) | Unchanged: 22 PASS, 4 KNOWN GAP, 0 FAIL. `system_tps`, `route_utilization`, `route_stress` still at a 5.14% median, so the frozen-share formula reproduces training's definition exactly and only the one-minute lag remains. |
+| End-to-end smoke test of `main.py` (in-memory Redis) | `/route` then `/outcome` three times; scoring, recording and outcome all work. With only 3 requests the reading clamped low each time and the clamp counter recorded 3, which is the intended signal for "too little traffic for this SCALE". |
+
+**Related fix:** Redis's eviction policy changed from `allkeys-lru` to
+`volatile-lru`. With counters now kept for 24 h, memory pressure is more
+plausible, and `allkeys-lru` could evict keys with no expiry, such as the
+running bank amount totals and the last-success markers, which can't be
+rebuilt. `volatile-lru` only evicts keys that have a TTL.
+
+
+## 18. Throughput Target
+
+### 18.1 Can one machine do 250k TPS?
+
+No, regardless of optimization. For scale: Visa's network is commonly cited at
+about 65,000 TPS capacity, and UPI averages under 10,000 TPS (about 20 billion
+transactions a month). Counting the current design's Redis calls:
+
+| Per transaction | Redis round-trips |
+|---|---|
+| `/route`: ~20 reads x 4 candidate routes, plus decision writes and the pending record | ~94 |
+| `/outcome` | ~20 |
+| **Total** | **~115** |
+
+At 250k TPS that's about 29 million Redis operations per second, against
+roughly 100k to 1M for a single instance. Separately, building a pandas
+DataFrame and running it through the sklearn `ColumnTransformer` for 4 rows costs
+around 1 to 3 ms of CPU, capping each core near 300 to 1,000 requests/second.
+And a single laptop can't *generate* 250k req/s of load either.
+
+### 18.2 Redefined target
+
+1. Maximize **per-node throughput** through a measured bottleneck loop: profile,
+   fix the top bottleneck, re-measure, log the numbers.
+2. Show **horizontal scaling** (1 to 3 replicas).
+3. **Project** the cluster size needed for 250k TPS from the measured numbers.
+
+### 18.3 The main lever: most features are constant within a minute
+
+Every clock window in the spec excludes the current minute (`[m-5, m)`), so
+these features are identical for every request during minute `m`: route
+success/failure rates (5m, 15m, 1m), average latency,
+`time_since_last_failure`, `route_flagged_down`, the bank×route rate, bank and
+network failure rates, and everything derived from them. That's about 20 of the
+26.
+
+Only `amount_to_bank_avg_ratio`, `time_since_last_bank_route_success`, and
+`system_tps` / `route_utilization` change per request.
+
+So each process can compute a per-minute snapshot once and serve the rest of the
+minute from memory. Reads per request drop from ~80 to ~3, **with no loss of
+parity**, because training uses the same "previous minutes only" rule.
+
+### 18.4 Planned bottleneck ladder (estimates, to be replaced by measurements)
+
+| Step | Change |
+|---|---|
+| 0 | Baseline measurement of the current code, with `py-spy`, Redis `INFO commandstats`, and the Grafana fetch-vs-scoring split |
+| 1 | Per-minute snapshot cache |
+| 2 | Remaining per-request reads and writes in one pipeline / Lua script (also gives the spec's atomicity) |
+| 3 | Replace pandas + `ColumnTransformer` with a precomputed numpy path; optionally a compiled LightGBM model |
+| 4 | Multiple processes per node (needs Prometheus multiprocess mode) |
+| 5 | Shard Redis / batch counter writes |
+
+A side effect: SCALE from Section 17.3 exists only because test traffic is far
+below production traffic, so it shrinks toward 1 as real throughput grows.
+
+The live dashboard UI is deferred until after this work.
+
+
+## 19. Train/Serve Parity Test
+
+### 19.1 What it is
+
+The 26 numeric features are computed twice, by unrelated code: in batch by
+training (`feature_extraction3.py`, `engineer_features()`) and live by serving
+(`serving/feature_storing.py`). When the two disagree nothing crashes, and
+ordinary unit tests don't catch it, because each side returns a valid number. A
+parity test compares them directly: give both the same history and check that
+they compute the same numbers. It is also the guard for the throughput work
+ahead. Every optimization rewrites how features are computed, and each one is
+only accepted if parity stays green.
+
+### 19.2 Design
+
+Three files in `tests/parity/`, each with one job:
+
+| File | Job |
+|---|---|
+| `history.py` | Rebuilds "what the world looked like just before a transaction" from the same CSVs training used. Knows nothing about serving. |
+| `adapter_current.py` | The only file that knows the current serving code's Redis key layout. Loads the history into an in-memory Redis (`fakeredis`), freezes the serving clock at the transaction's minute, and calls `build_route_features()` exactly as `/route` does. A rewrite of serving gets a new adapter; nothing else changes. |
+| `run_parity.py` | The referee. Gets training's answers by running `ml/lightgbm_tuned.py::load_data` (cached after the first run), picks transactions, compares every feature, prints a report, and exits non-zero on failure. |
+
+Sample: 500 test-week transactions (400 random, 50 during route incidents, 50 in
+quiet hours 2 to 4am; seed 7). Values count as equal within a relative
+tolerance of 1e-6.
+
+**Two streams.** Training built route health (5m/15m success rate, latency,
+incidents) and `system_tps` from the production-scale stream (`route_metrics`),
+but bank, network, bank×route, the amount ratio, last-success and
+`route_failure_rate_1m` from the sampled transactions. The history keeps these
+separate and feeds each formula the stream it was trained on, because that's
+what "same inputs" means.
+
+**Scope.** The test checks formulas given identical inputs. It does not check
+whether live inputs resemble training inputs (the Section 17 scale problem), and
+it does not exercise the write path. For example, the in-flight bug from
+Section 15.3 can't appear in fully-resolved replayed history.
+
+### 19.3 First run against the original serving code: 13 of 26 failed
+
+The failures traced to four root causes:
+
+| Cause | Features | Evidence |
+|---|---|---|
+| Hardcoded nominal constants | 7: both base constants, `route_success_drop_5m/15m`, `route_latency_ratio`, `bank_route_success_rate_15m`, `bank_route_gap` | Five features shared the identical worst difference, 0.0384997, which is R4's base-rate error. That's the signature of one bug spreading through derived features. |
+| Clock-minute windows instead of the last 5 *active* minutes | 2: bank and network failure rates | 45/500 and 25/500 mismatches, concentrated at quiet times. Example: training 1/7 = 0.143, serving 0.0. |
+| Previous-minute vs current-minute traffic | 3: `system_tps`, `route_utilization`, `route_stress` | Up to 20% off. Example: training 10,452, serving 9,869. |
+| Two streams | 1: `route_failure_rate_1m` | Training 0.0 (a handful of sampled transactions, none failed); serving 0.019 (production-scale stream). |
+
+The 13 that passed cover the core machinery: the "previous minutes only" window
+logic, rates, latency, incident flags, the running timers and totals, and the
+time features. The design was sound; the bugs were specific.
+
+### 19.4 Should `route_failure_rate_1m` get its own counter?
+
+Measured on the full test week (165,857 transactions):
+
+| Measure | Value |
+|---|---|
+| Gain importance | 6.50%, **rank 3 of 33** inputs |
+| Split importance | 1.82% |
+| ROC-AUC with the feature shuffled | 0.75082 to **0.62322** |
+
+| Fed from | ROC-AUC | Log loss | Brier |
+|---|---|---|---|
+| Sampled stream (as trained) | 0.75082 | 0.16001 | 0.03575 |
+| Production-scale stream | 0.75087 | 0.15968 | 0.03553 |
+
+11.12% of predictions moved by more than 0.01. On those, log loss went from
+0.34538 to 0.34213 and Brier from 0.10218 to 0.10014, so they got *better*. The
+sampled version is noisy: one failure in one transaction reads as 100%.
+
+**Decision: one store, prioritizing throughput.** The feature is important, but
+the source swap doesn't hurt, so a second counter would only buy exact
+testability at the cost of a Redis write on every outcome. Caveat for later:
+live, a route the model rarely picks gets few outcomes and noisy rates. That
+affects both designs equally, and it's the "dormant terminal" problem the
+Razorpay paper lists as future work.
+
+**Note on importance figures elsewhere in this report.** Earlier sections quote
+LightGBM's default *split* importance, which counts how often a feature is used,
+not how much it helps. Gain tells a different story. Top 10 by gain:
+`route_success_rate_5m` 15.31%, `route_failure_rate_5m` 9.05%,
+`route_failure_rate_1m` 6.50%, `time_since_last_failure` 6.18%, `amount` 4.67%,
+`bank_route_success_rate_15m` 4.39%, `network_failure_rate_5m` 4.22%,
+`route_utilization` 4.11%, `system_tps` 4.10%, `bank_route_gap` 3.84%.
+`route_success_rate_5m` is the strongest feature by gain but only 3.35% by
+split.
+
+### 19.5 The fixes
+
+- **Constants generated, not typed.** `ml/export_serving_constants.py` writes
+  `models/serving_constants_v2.json` from the training rows (base rates,
+  latencies, fees), `routes.py` (capacities, eligibility), `router.py` (routing
+  shares), and the training `system_tps` range. `feature_storing.py` loads it
+  (path overridable with `SERVING_CONSTANTS_PATH`), and the Dockerfile copies it
+  into the image.
+- **Active-minute windows.** `/outcome` records each minute with bank or network
+  traffic in a sorted set (`{scope}:active`, trimmed to 24 h). The new
+  `failure_rate_over_last_active_minutes()` reads the last 5 such minutes and
+  returns NaN when there are none, matching training instead of inventing 0.0.
+  Counter TTL went from 30 minutes to 24 hours, because a quiet bank's last 5
+  active minutes can be hours old at night.
+- **Known gaps.** Causes 3 and 4 can't be removed by any formula, so the referee
+  labels those four features KNOWN GAP. Each still has a limit on its *median*
+  difference (10% relative for the three traffic features, 0.05 absolute for
+  `route_failure_rate_1m`). Exceeding it reports GAP TOO BIG and fails the run,
+  so a real regression can't hide behind the label; the original 160,000-vs-200
+  scale bug would blow straight through it.
+
+### 19.6 Second run: 22 PASS, 4 KNOWN GAP, 0 FAIL
+
+| Known gap | Median difference | Limit |
+|---|---|---|
+| `system_tps` | 5.14% | 10% |
+| `route_utilization` | 5.14% | 10% |
+| `route_stress` | 5.14% | 10% |
+| `route_failure_rate_1m` | 0.0189 | 0.05 |
+
+The 5.14% matches the simulator's own ±5% minute-to-minute traffic noise. The
+two derived features show the identical figure because both scale linearly with
+`system_tps`. All four sit at roughly half their limits.
+
+
+## 20. Current State and Next Steps
+
+**Done since Section 15:** environment rebuilt; feature CSV regenerated and
+verified; serving spec verified against training data; constants generated
+from training data; bank/network active-minute windows; parity test built (13
+failing to 0 failing); `route_failure_rate_1m` decision measured; README
+updated with the parity results and known gaps.
+
+**Next, in order:**
+
+1. ~~Scaled live traffic meter~~ (done, Section 17.4).
+2. **Install Docker** and record a real baseline throughput run with profiling.
+3. **Bottleneck loop** (Section 18.4), with the parity test green at every step.
+   One free win is already known: since the in-flight fix (Section 15.3), no
+   read uses the per-scope `req` counters (rates divide by `resolved`;
+   utilization now uses the meter), yet `record_routing_decision()` still writes
+   them for route, bank, network and bank×route, about 8 dead Redis operations
+   per request. They were left in deliberately so the baseline measures the
+   design as it stood; removing them is the first measured step.
+4. **Horizontal scaling run** and the 250k TPS cluster projection.
+5. **Remaining spec items:** credit outcomes to the attempt minute rather than
+   the callback minute; idempotent outcomes; a write-path test; NaN instead of
+   baseline fallbacks for the route rates at cold start (they currently fall
+   back to the training base rate, where training would give NaN and the imputer
+   would use 0.981).
+6. Correct the artifact's stored threshold (Section 16.4).
+7. Live dashboard UI.
+

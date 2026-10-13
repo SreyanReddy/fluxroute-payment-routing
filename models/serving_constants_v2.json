@@ -1,0 +1,77 @@
+{
+  "model": "models/lightgbm_tuned_v2.joblib",
+  "source": "training rows of dataset-generator-routing/payment_dataset_features_4week_v2.csv",
+  "routes": {
+    "R1": {
+      "base_success_rate": 0.9701643031658416,
+      "base_latency_ms": 168.53432462479154,
+      "cost_percent": 2.1,
+      "base_capacity_tps": 120000,
+      "routing_share": 0.35,
+      "supported_payment_methods": [
+        "CARD",
+        "UPI"
+      ],
+      "supported_networks": [
+        "Mastercard",
+        "UPI",
+        "Visa"
+      ]
+    },
+    "R2": {
+      "base_success_rate": 0.9561236269502552,
+      "base_latency_ms": 116.1170768907857,
+      "cost_percent": 1.45,
+      "base_capacity_tps": 150000,
+      "routing_share": 0.25,
+      "supported_payment_methods": [
+        "CARD",
+        "UPI"
+      ],
+      "supported_networks": [
+        "Rupay",
+        "UPI",
+        "Visa"
+      ]
+    },
+    "R3": {
+      "base_success_rate": 0.96274718384772,
+      "base_latency_ms": 130.18236465209336,
+      "cost_percent": 1.1,
+      "base_capacity_tps": 100000,
+      "routing_share": 0.25,
+      "supported_payment_methods": [
+        "CARD",
+        "UPI"
+      ],
+      "supported_networks": [
+        "Mastercard",
+        "Rupay",
+        "UPI",
+        "Visa"
+      ]
+    },
+    "R4": {
+      "base_success_rate": 0.944500315737774,
+      "base_latency_ms": 283.69247035573125,
+      "cost_percent": 1.75,
+      "base_capacity_tps": 75000,
+      "routing_share": 0.15,
+      "supported_payment_methods": [
+        "CARD",
+        "UPI"
+      ],
+      "supported_networks": [
+        "Mastercard",
+        "Rupay",
+        "UPI",
+        "Visa"
+      ]
+    }
+  },
+  "system_tps_training": {
+    "min": 8458.461664016082,
+    "median": 162978.06212104612,
+    "max": 308555.1590391076
+  }
+}

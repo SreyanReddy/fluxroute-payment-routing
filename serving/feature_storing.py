@@ -6,7 +6,10 @@ formulas MUST be mirrored here, or the model silently sees train/serve
 skew -- exactly the class of bug the ML phase spent real effort catching.
 """
 
+import json
+import os
 import time
+
 import redis
 
 # ============================================================
@@ -18,49 +21,59 @@ WINDOW_15M = 15
 FLAG_DOWN_THRESHOLD = 0.70
 BANK_ROUTE_SHRINK_K = 10
 NO_FAILURE_SENTINEL = 9999
-BUCKET_TTL_SECONDS = 1800  # 30 min, comfortably past the 15m window
+
+# Bank and network failure rates look back over the last 5 minutes that had
+# any traffic, which can stretch far back at quiet times, so counters are
+# kept for a day rather than just past the 15-minute window.
+BUCKET_TTL_SECONDS = 24 * 60 * 60
+ACTIVE_RECORDS = 5
+ACTIVE_RETENTION_MINUTES = 24 * 60
 
 # ============================================================
-# STATIC ROUTE CONFIG -- mirrors dataset-generator-routing/routes.py.
-# Keep in sync manually for now; replace with a real config service later.
+# STATIC ROUTE CONFIG -- loaded from models/serving_constants_v2.json,
+# which ml/export_serving_constants.py generates from the training data.
+# Never type these numbers in by hand: the model learned the values that
+# training measured, not the simulator's nominal settings.
 # ============================================================
+
+CONSTANTS_PATH = os.environ.get(
+    "SERVING_CONSTANTS_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "serving_constants_v2.json"),
+)
+
+with open(CONSTANTS_PATH) as _f:
+    _CONSTANTS = json.load(_f)
 
 ROUTE_STATIC_CONFIG = {
-    "R1": {
-        "base_success_rate": 0.986,
-        "base_latency_ms": 145,
-        "cost_percent": 2.10,
-        "base_capacity_tps": 120_000,
-        "supported_payment_methods": {"CARD", "UPI"},
-        "supported_networks": {"Visa", "Mastercard", "UPI"},
-    },
-    "R2": {
-        "base_success_rate": 0.981,
-        "base_latency_ms": 85,
-        "cost_percent": 1.45,
-        "base_capacity_tps": 150_000,
-        "supported_payment_methods": {"CARD", "UPI"},
-        "supported_networks": {"Visa", "Rupay", "UPI"},
-    },
-    "R3": {
-        "base_success_rate": 0.979,
-        "base_latency_ms": 110,
-        "cost_percent": 1.10,
-        "base_capacity_tps": 100_000,
-        "supported_payment_methods": {"CARD", "UPI"},
-        "supported_networks": {"Visa", "Mastercard", "Rupay", "UPI"},
-    },
-    "R4": {
-        "base_success_rate": 0.983,
-        "base_latency_ms": 175,
-        "cost_percent": 1.75,
-        "base_capacity_tps": 75_000,
-        "supported_payment_methods": {"CARD", "UPI"},
-        "supported_networks": {"Visa", "Mastercard", "Rupay", "UPI"},
-    },
+    route_id: {
+        **values,
+        "supported_payment_methods": set(values["supported_payment_methods"]),
+        "supported_networks": set(values["supported_networks"]),
+    }
+    for route_id, values in _CONSTANTS["routes"].items()
 }
 
 ALL_ROUTE_IDS = list(ROUTE_STATIC_CONFIG.keys())
+
+# ============================================================
+# LIVE TRAFFIC METER -- the model's "how busy is the system" dial.
+#
+# Training saw production-scale traffic: system_tps from ~8k (3am) to ~308k
+# (weekend peak). A live service can only count the requests that reach it,
+# so it multiplies its own rate by TRAFFIC_SCALE -- "each request I see
+# stands for this many in the whole payment system" -- and clamps the result
+# to the range training saw.
+#
+# TRAFFIC_SCALE is a setting, not a constant. For a load test, choose
+#     training median / planned test rate     (162,978 / 200 is about 800)
+# so the planned load lands in the middle of the range.
+# ============================================================
+
+TRAFFIC_SCALE = float(os.environ.get("TRAFFIC_SCALE", "1.0"))
+SYSTEM_TPS_MIN = _CONSTANTS["system_tps_training"]["min"]
+SYSTEM_TPS_MAX = _CONSTANTS["system_tps_training"]["max"]
+INGRESS_WINDOW_SECONDS = 60
+INGRESS_TTL_SECONDS = 120
 
 
 def get_eligible_routes(payment_method: str, network: str) -> list[str]:
@@ -76,9 +89,6 @@ def get_eligible_routes(payment_method: str, network: str) -> list[str]:
 # REDIS CLIENT
 # ============================================================
 
-
-import os
-
 _redis_client = None
 
 def get_redis_client() -> redis.Redis:
@@ -92,8 +102,42 @@ def get_redis_client() -> redis.Redis:
         )
     return _redis_client
 
+def current_second() -> int:
+    return int(time.time())
+
+
 def current_minute() -> int:
-    return int(time.time() // 60)
+    return current_second() // 60
+
+
+def record_ingress(second: int) -> None:
+    """Count one arriving request in its second's bucket."""
+    r = get_redis_client()
+    key = f"fr:ingress:sec:{second}"
+    r.incr(key)
+    r.expire(key, INGRESS_TTL_SECONDS)
+
+
+def read_system_tps(now_second: int) -> tuple[float, str | None]:
+    """
+    Requests per second over the last 60 completed seconds, scaled up to
+    production size and clamped to the range training saw.
+
+    The current second is excluded, so a request never counts itself.
+    Read it once per request: every candidate route gets the same value.
+
+    Returns (system_tps, clamp) where clamp is "low", "high", or None.
+    """
+    r = get_redis_client()
+    keys = [f"fr:ingress:sec:{now_second - k}" for k in range(1, INGRESS_WINDOW_SECONDS + 1)]
+    requests = sum(float(v) for v in r.mget(keys) if v is not None)
+    observed = requests / INGRESS_WINDOW_SECONDS * TRAFFIC_SCALE
+
+    if observed < SYSTEM_TPS_MIN:
+        return SYSTEM_TPS_MIN, "low"
+    if observed > SYSTEM_TPS_MAX:
+        return SYSTEM_TPS_MAX, "high"
+    return observed, None
 
 
 # ============================================================
@@ -111,9 +155,23 @@ def record_request(scope: str) -> None:
     r.expire(key, BUCKET_TTL_SECONDS)
 
 
-def record_outcome(scope: str, success: bool, latency_ms: float | None = None) -> None:
+def record_outcome(
+    scope: str,
+    success: bool,
+    latency_ms: float | None = None,
+    track_active: bool = False,
+) -> None:
     r = get_redis_client()
     minute = current_minute()
+
+    if track_active:
+        active_key = f"{scope}:active"
+        r.zadd(active_key, {minute: minute})
+        r.zremrangebyscore(active_key, "-inf", minute - ACTIVE_RETENTION_MINUTES)
+
+    resolved_key = _bucket_key(scope, "resolved", minute)
+    r.incr(resolved_key)
+    r.expire(resolved_key, BUCKET_TTL_SECONDS)
 
     if success:
         key = _bucket_key(scope, "succ", minute)
@@ -139,20 +197,54 @@ def sum_window(scope: str, metric: str, window_minutes: int) -> float:
 
 
 def get_rolling_rate(scope: str, window_minutes: int) -> tuple[float | None, float]:
-    """Returns (success_rate_or_None, request_count). None = no traffic yet."""
-    requests = sum_window(scope, "req", window_minutes)
+    """
+    Returns (success_rate_or_None, resolved_count).
+
+    The denominator is RESOLVED outcomes, not requests. A request is counted
+    when the routing decision is made, but its success is only counted when
+    /outcome arrives -- dividing by requests would count every in-flight
+    transaction as a failure and bias every route's rate downward.
+    """
+    resolved = sum_window(scope, "resolved", window_minutes)
     successes = sum_window(scope, "succ", window_minutes)
-    if requests <= 0:
+    if resolved <= 0:
         return None, 0.0
-    return successes / requests, requests
+    return successes / resolved, resolved
+
+
+def failure_rate_over_last_active_minutes(scope: str, before_minute: int) -> float:
+    """
+    Failure rate over the last ACTIVE_RECORDS minutes, before `before_minute`,
+    in which this scope had any resolved transaction.
+
+    This is how training computed bank_failure_rate_5m and
+    network_failure_rate_5m: engineer_features() rolls over minutes that had
+    transactions, not clock minutes. At quiet times the last 5 active minutes
+    can reach far back, while the last 5 clock minutes may be nearly empty.
+    Returns NaN when there is no earlier active minute, as training does.
+    """
+    r = get_redis_client()
+    minutes = r.zrevrangebyscore(
+        f"{scope}:active", before_minute - 1, "-inf", start=0, num=ACTIVE_RECORDS
+    )
+    if not minutes:
+        return float("nan")
+
+    resolved = r.mget([_bucket_key(scope, "resolved", int(m)) for m in minutes])
+    successes = r.mget([_bucket_key(scope, "succ", int(m)) for m in minutes])
+    total = sum(float(v) for v in resolved if v is not None)
+    if total <= 0:
+        return float("nan")
+    succeeded = sum(float(v) for v in successes if v is not None)
+    return (total - succeeded) / total
 
 
 def get_rolling_avg_latency(scope: str, window_minutes: int) -> float | None:
-    requests = sum_window(scope, "req", window_minutes)
+    resolved = sum_window(scope, "resolved", window_minutes)
     latency_sum = sum_window(scope, "lat", window_minutes)
-    if requests <= 0:
+    if resolved <= 0:
         return None
-    return latency_sum / requests
+    return latency_sum / resolved
 
 
 # ============================================================
@@ -207,12 +299,16 @@ def record_bank_amount(bank: str, amount: float) -> None:
 def build_route_features(
     route_id: str, bank: str, network: str, amount: float,
     payment_method: str, merchant: str, device: str, risk: str,
+    system_tps: float,
 ) -> dict:
     """
     Returns every NUMERIC_FEATURES / CATEGORICAL_FEATURES key the model
     expects, for ONE candidate route. Call once per eligible route per
     incoming transaction, during scoring -- before a routing decision
     is made. No Redis writes happen here.
+
+    system_tps is the traffic-meter reading from read_system_tps(), taken
+    once per request and shared by every candidate route.
     """
     now = current_minute()
     config = ROUTE_STATIC_CONFIG[route_id]
@@ -227,24 +323,22 @@ def build_route_features(
     if failure_rate_1m is not None:
         failure_rate_1m = 1.0 - failure_rate_1m
 
-    route_request_rate_tps = sum_window(f"route:{route_id}", "req", 1) / 60.0
-    route_utilization = route_request_rate_tps / config["base_capacity_tps"]
-    system_request_rate_tps = sum_window("global", "req", 1) / 60.0
+    # Training split traffic by fixed shares (R1 always 35%, R4 always 15%),
+    # so utilization meant "how stressed would this route be under the
+    # standard split, given how busy the system is". Live, the model decides
+    # where traffic goes; using each route's actual traffic would make the
+    # feature describe the model's own choices, which training never showed.
+    route_utilization = system_tps * config["routing_share"] / config["base_capacity_tps"]
 
-    bank_failure_rate_5m, _ = get_rolling_rate(f"bank:{bank}", WINDOW_5M)
-    if bank_failure_rate_5m is not None:
-        bank_failure_rate_5m = 1.0 - bank_failure_rate_5m
+    bank_failure_rate_5m = failure_rate_over_last_active_minutes(f"bank:{bank}", now)
+    network_failure_rate_5m = failure_rate_over_last_active_minutes(f"network:{network}", now)
 
-    network_failure_rate_5m, _ = get_rolling_rate(f"network:{network}", WINDOW_5M)
-    if network_failure_rate_5m is not None:
-        network_failure_rate_5m = 1.0 - network_failure_rate_5m
-
-    bank_route_requests_15m = sum_window(f"bankroute:{bank}:{route_id}", "req", WINDOW_15M)
+    bank_route_resolved_15m = sum_window(f"bankroute:{bank}:{route_id}", "resolved", WINDOW_15M)
     bank_route_successes_15m = sum_window(f"bankroute:{bank}:{route_id}", "succ", WINDOW_15M)
     prior = config["base_success_rate"]
     bank_route_success_rate_15m = (
         bank_route_successes_15m + BANK_ROUTE_SHRINK_K * prior
-    ) / (bank_route_requests_15m + BANK_ROUTE_SHRINK_K)
+    ) / (bank_route_resolved_15m + BANK_ROUTE_SHRINK_K)
 
     time_since_last_failure = minutes_since_route_flagged(route_id)
     time_since_last_bank_route_success = minutes_since_bank_route_success(bank, route_id)
@@ -257,8 +351,6 @@ def build_route_features(
     success_rate_15m = success_rate_15m if success_rate_15m is not None else config["base_success_rate"]
     avg_latency_5m = avg_latency_5m if avg_latency_5m is not None else config["base_latency_ms"]
     failure_rate_1m = failure_rate_1m if failure_rate_1m is not None else (1.0 - config["base_success_rate"])
-    bank_failure_rate_5m = bank_failure_rate_5m if bank_failure_rate_5m is not None else 0.0
-    network_failure_rate_5m = network_failure_rate_5m if network_failure_rate_5m is not None else 0.0
 
     route_flagged_down = float(success_rate_5m < FLAG_DOWN_THRESHOLD)
 
@@ -283,7 +375,7 @@ def build_route_features(
         "time_since_last_failure": time_since_last_failure,
         "route_flagged_down": route_flagged_down,
         "route_utilization": route_utilization,
-        "system_tps": system_request_rate_tps,
+        "system_tps": system_tps,
         "bank_route_success_rate_15m": bank_route_success_rate_15m,
         "route_failure_rate_5m": route_failure_rate_5m,
         "route_failure_rate_15m": route_failure_rate_15m,
@@ -317,7 +409,6 @@ def record_routing_decision(route_id: str, bank: str, network: str, amount: floa
     record_request(f"bank:{bank}")
     record_request(f"network:{network}")
     record_request(f"bankroute:{bank}:{route_id}")
-    record_request("global")
     record_bank_amount(bank, amount)
 
 
@@ -326,8 +417,8 @@ def record_transaction_outcome(
 ) -> None:
     """Call exactly once, when the real outcome is known (callback/webhook)."""
     record_outcome(f"route:{route_id}", success, latency_ms)
-    record_outcome(f"bank:{bank}", success)
-    record_outcome(f"network:{network}", success)
+    record_outcome(f"bank:{bank}", success, track_active=True)
+    record_outcome(f"network:{network}", success, track_active=True)
     record_outcome(f"bankroute:{bank}:{route_id}", success)
 
     if success:

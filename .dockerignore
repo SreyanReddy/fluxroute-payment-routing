@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+dataset-generator-routing/*.csv
+*.csv
+.git/
+.claude/
+loadtest/
+deploy/
+report.md
+README.md
+.venv-load/

@@ -16,11 +16,13 @@ Modeled on the problem described in Razorpay's
 | Phase | State |
 |---|---|
 | Dataset generation (load-aware route health simulation) | Complete |
-| Feature engineering (26 features, leakage-audited) | Complete |
+| Feature engineering (33 features, leakage-audited) | Complete |
 | Model training, calibration, cost-based threshold selection | Complete |
 | Offline routing evaluation vs. round-robin baseline | Complete |
-| FastAPI serving layer + Redis feature store | Working locally |
-| Containerization, replicas, load testing, monitoring | **In progress** |
+| FastAPI serving layer + Redis feature store | Complete |
+| Train/serve parity test (`tests/parity/`) | 22 exact, 4 documented known gaps, 0 failing |
+| Containerization, 3 replicas behind nginx, Prometheus + Grafana | Complete |
+| Load test harness (Locust) | Built — results pending a recorded run |
 | CacheX integration (custom Redis clone, separate repo) | Planned |
 
 ---
@@ -73,7 +75,7 @@ claim of outperforming their system.
 │  request        │     │  /route          │     │  route      │
 └─────────────────┘     └────────┬─────────┘     └─────────────┘
                                  │
-                        reads 26 features
+                        reads 33 features
                         per candidate route
                                  │
                                  ▼
@@ -133,7 +135,7 @@ deriving them from the sampled rows alone.
 28 simulated days, split chronologically 75/25 — **not** randomly. Route health
 drifts over time, so a random split would leak future route state into training.
 
-### Features (26)
+### Features (33: 26 numeric + 7 categorical)
 
 - **Transaction**: amount, bank, network, payment method, merchant category,
   device, risk tier, hour-of-day, day-of-week
@@ -223,6 +225,162 @@ to fix.
 
 ---
 
+## Deployment
+
+```
+                    ┌──────────────────┐
+   load  ─────────▶ │  nginx :8080     │  least_conn, keepalive
+                    └────────┬─────────┘
+                     ┌───────┼───────┐
+                     ▼       ▼       ▼
+                  ┌─────┐ ┌─────┐ ┌─────┐
+                  │app1 │ │app2 │ │app3 │  uvicorn, 1 worker each
+                  └──┬──┘ └──┬──┘ └──┬──┘
+                     └───────┼───────┘
+                             ▼
+                     ┌───────────────┐        ┌────────────┐
+                     │  Redis        │        │ Prometheus │──▶ Grafana
+                     │ feature store │        │  :9090     │     :3000
+                     └───────────────┘        └────────────┘
+```
+
+The service is stateless — all shared state lives in Redis, so replicas scale
+horizontally without coordination. Each instance exposes `/metrics`; Prometheus
+scrapes all three and Grafana provisions a dashboard covering p50/p95/p99
+routing latency, per-instance throughput, route-selection distribution, observed
+success rate, and a **latency breakdown separating Redis feature-fetch time from
+model scoring time** — which is the number that tells you whether the cache or
+the model is the bottleneck, and the baseline the CacheX comparison will be
+measured against.
+
+```bash
+docker compose up --build
+
+curl http://localhost:8080/health
+```
+
+| Service | URL |
+|---|---|
+| Routing API (via nginx) | http://localhost:8080 |
+| Prometheus | http://localhost:9090 |
+| Grafana (anonymous viewer) | http://localhost:3000 |
+
+### Load testing
+
+```bash
+pip install -r loadtest/requirements.txt
+locust -f loadtest/locustfile.py --host http://localhost:8080
+```
+
+The Locust scenario samples transactions from the same distributions as the
+dataset generator, calls `/route`, then reports a simulated outcome back to
+`/outcome` — so the load test drives the real feedback loop rather than
+hammering a read-only endpoint, and route health actually evolves under load.
+
+> Load-test results are not recorded here yet. Numbers go in this section once
+> a run has actually been performed, and not before.
+
+### Live traffic meter
+
+`system_tps` is the model's "how busy is the whole payment system" input. It was
+trained on the simulator's production-scale stream (8,458 to 308,555 TPS), but a
+live service can only count the requests that reach it, a few hundred per second
+under a load test. Fed raw, a tree model treats that as the quietest night it
+ever saw, on every request.
+
+The service treats its own traffic as a sample of a larger stream, the way the
+dataset itself is a 1-in-400,000 sample:
+
+1. Every `/route` request increments a per-second counter in Redis.
+2. Each request reads the last 60 *completed* seconds (so it never counts itself)
+   once, and all candidate routes share that reading.
+3. The rate is multiplied by `TRAFFIC_SCALE`: how many requests in the full
+   system each request represents.
+4. The result is clamped to the training range.
+5. `route_utilization = system_tps × routing_share / capacity`, using the
+   training's fixed routing shares. Using each route's *actual* traffic would let
+   the feature describe the model's own routing choices, which training never
+   showed it.
+
+Choose `TRAFFIC_SCALE` so the planned load lands mid-range:
+`162,978 / planned req/s` (about 800 for 200 req/s; the compose default).
+Override per run with `TRAFFIC_SCALE=500 docker compose up --build`. Grafana can
+show the reading (`fluxroute_system_tps`) and how often it hits the clamp
+(`fluxroute_system_tps_clamped_total`). Constant clamping means `TRAFFIC_SCALE`
+is wrong for the load being run. `tests/traffic_meter_check.py` checks the
+scaling, both clamps, and that the current second is excluded.
+
+This changes what the model decides, not how long deciding takes, so it doesn't
+affect throughput measurements. Remaining limitation: in training, high traffic
+always meant evening, so a flat load test can produce combinations the model
+rarely saw (peak traffic at 3am). Retraining with the live-meter definition is
+the long-term fix.
+
+---
+
+## Train/Serve Parity
+
+The 26 numeric features are computed twice: in batch by the training pipeline
+(pandas over the full history) and live by the serving layer (Redis, one request
+at a time). If the two disagree, nothing crashes. The model just silently
+receives inputs that mean something different from what it learned
+(*training-serving skew*).
+
+`tests/parity/` checks this directly. It takes 500 transactions from the test
+week (ordinary moments, moments during route incidents, and quiet night hours),
+rebuilds the exact history that existed just before each one, runs the serving
+feature code on it, and compares every feature against what training computed.
+
+**Current result: 22 PASS, 4 KNOWN GAP, 0 FAIL.**
+
+The first run against the original serving code failed 13 of 26 features, from
+four root causes:
+
+| Root cause | Features | Outcome |
+|---|---|---|
+| Route constants typed in by hand from the simulator's nominal settings, not what training measured (R4 latency 175 ms vs. 283.69 ms actual) | 7 (one bug spreading into derived features) | **Fixed.** Constants are now generated from the training data by `ml/export_serving_constants.py` into `models/serving_constants_v2.json` |
+| Bank/network failure rates used the last 5 clock minutes; training used the last 5 minutes that had any traffic | 2 | **Fixed.** Active minutes tracked in a Redis sorted set |
+| Training knew the current minute's traffic; a live service only knows the previous minute's | 3 | Known gap |
+| Training built one feature from a different data stream than the rest | 1 | Known gap |
+
+### Known gaps
+
+These cannot match exactly. They are still measured on every run, and each has a
+limit on its typical (median) difference, so a real regression can't hide behind
+the label.
+
+| Feature | Median difference | Allowed | Why |
+|---|---|---|---|
+| `system_tps` | 5.1% | 10% | The simulator decides each minute's traffic at the start of the minute, so training knew it. A live service can only measure traffic that has already arrived and uses the previous minute. The 5% matches the simulator's own minute-to-minute traffic noise. |
+| `route_utilization` | 5.1% | 10% | Built from `system_tps`; inherits the same gap. |
+| `route_stress` | 5.1% | 10% | Built from `route_utilization`; inherits the same gap. |
+| `route_failure_rate_1m` | 0.019 (absolute) | 0.05 | Training computed it from the sampled transactions (a handful per route per minute); the other route-health features came from the production-scale stream. A live service has one stream: its own outcomes. |
+
+**Why `route_failure_rate_1m` was left as a gap rather than given its own
+counter.** The feature matters: by gain it ranks 3rd of 33 inputs, and shuffling
+it drops ROC-AUC from 0.751 to 0.623. But feeding it from the production-scale
+stream instead costs nothing:
+
+| | As trained (sampled) | Production-scale stream |
+|---|---|---|
+| ROC-AUC | 0.75082 | 0.75087 |
+| Log loss | 0.16001 | 0.15968 |
+| Brier | 0.03575 | 0.03553 |
+
+The 11% of predictions that moved got slightly *better*. The sampled version is
+noisy: one failure out of one transaction reads as 100%. A separate counter would
+have added a Redis write to every outcome to buy exact testability, not better
+predictions, so throughput won.
+
+**What the parity test does not cover.** It feeds the serving code the same data
+training used, so it verifies *formulas*, not *inputs*. Live, the service
+measures its own traffic, which is orders of magnitude below the ~160k TPS
+production stream `system_tps` was trained on. That's a separate problem, handled
+by the scaled traffic meter (see [Live traffic meter](#live-traffic-meter)). It also doesn't exercise the write
+path (how `/outcome` updates Redis), which needs its own test.
+
+---
+
 ## Running it
 
 ```bash
@@ -233,37 +391,49 @@ cd dataset-generator-routing && python generate.py && cd ..
 
 # Train, calibrate, evaluate
 python ml/lightgbm_tuned.py
-python ml/isotonic_recalibration.py
-python ml/cost_function_check.py
+python ml/isotonic_recalbration.py
+python ml/combo_cost_metrics.py
+python ml/sensitivity_check.py
 python routing_simulation.py
 
-# Serve
-docker run -d -p 6379:6379 redis
-cd serving && uvicorn main:app --reload
+# Serving constants (generated from training data) and the parity test
+python ml/export_serving_constants.py
+pip install -r tests/requirements.txt
+python tests/parity/run_parity.py
+python tests/traffic_meter_check.py
+
+# Serve (full stack)
+docker compose up --build
 ```
 
 ```bash
-curl -X POST http://localhost:8000/route \
+curl -X POST http://localhost:8080/route \
   -H "Content-Type: application/json" \
   -d '{"amount": 2500.0, "bank": "HDFC", "network": "UPI",
        "payment_method": "UPI", "merchant": "Shopping",
        "device": "Android", "risk": "LOW"}'
 ```
 
+For a single local instance without Docker:
+
+```bash
+docker run -d -p 6379:6379 redis
+cd serving && uvicorn main:app --reload
+```
+
 ---
 
 ## In Progress / Next
 
-- **Containerization and horizontal scaling** — Dockerfile and compose setup for
-  the service + Redis, then multiple stateless replicas behind a load balancer
-  sharing one Redis backend.
-- **Load testing** — Locust/k6 against the replicated service for p99 latency
-  and throughput under concurrency.
-- **Monitoring** — Prometheus/Grafana, or structured logging plus a dashboard
-  covering latency, route-selection distribution, and error rates.
+- **Recorded load-test results** — the harness and the full replicated stack are
+  built; p99 latency and throughput figures still need an actual measured run.
+  Target: maximize per-node throughput, then project the cluster needed for
+  250k TPS from measured numbers.
 - **CacheX swap-in** — replacing Redis with a from-scratch C++ RESP2-compatible
-  cache (separate repo), then re-running the identical load-test suite to
-  measure the overhead of a hand-written cache vs. production Redis.
+  cache (separate repo), then re-running the identical Locust suite to measure
+  the overhead of a hand-written cache vs. production Redis. The Grafana panel
+  separating feature-fetch latency from scoring latency exists specifically to
+  isolate this.
 - **Closed-loop routing evaluation** — the offline simulation assumes a single
   routing decision doesn't affect future route health. Now that load drives
   degradation, a sequential evaluation where decisions feed back into
@@ -271,3 +441,7 @@ curl -X POST http://localhost:8000/route \
   closed loop, so load testing measures this directly.)
 - **Cost-aware ranking** — routing currently maximizes success probability, not
   expected profit. Razorpay's paper lists the same thing as future work.
+- **Timezone anchoring** — `hour_of_day` is derived from UTC at serving time,
+  while the simulator's traffic curve is in unanchored "local" time. Harmless on
+  synthetic data, but a real deployment would need the serving clock aligned to
+  whatever timezone the traffic pattern was learned in.

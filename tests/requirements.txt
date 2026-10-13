@@ -1,0 +1,1 @@
+fakeredis>=2.20
