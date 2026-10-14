@@ -1,1 +1,2 @@
 fakeredis>=2.20
+httpx

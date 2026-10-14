@@ -29,6 +29,7 @@ services:
       REDIS_PORT: 6379
       INSTANCE_ID: app1
       TRAFFIC_SCALE: ${TRAFFIC_SCALE:-800}
+      LOG_SAMPLE_RATE: ${LOG_SAMPLE_RATE:-0.01}
 
   app2:
     <<: *app
@@ -37,6 +38,7 @@ services:
       REDIS_PORT: 6379
       INSTANCE_ID: app2
       TRAFFIC_SCALE: ${TRAFFIC_SCALE:-800}
+      LOG_SAMPLE_RATE: ${LOG_SAMPLE_RATE:-0.01}
 
   app3:
     <<: *app
@@ -45,6 +47,7 @@ services:
       REDIS_PORT: 6379
       INSTANCE_ID: app3
       TRAFFIC_SCALE: ${TRAFFIC_SCALE:-800}
+      LOG_SAMPLE_RATE: ${LOG_SAMPLE_RATE:-0.01}
 
   nginx:
     image: nginx:1.27-alpine

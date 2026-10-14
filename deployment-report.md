@@ -976,9 +976,12 @@ request threads can create hundreds of OpenMP threads per process. That matches
 the ~300 PIDS per app container: roughly 900 threads competing for 16 cores, to
 score 4 rows each. Pandas overhead on tiny DataFrames (the `DataFrame` build,
 column selection and the sklearn preprocessor) likely contributes too.
-*Status: hypothesis.* The next check is comparing PIDS at idle with PIDS under
-load. Setting `OMP_NUM_THREADS=1` is the experiment that confirms or rules it
-out.
+*Status: strongly supported, not yet confirmed.* At idle each app container has
+**51** threads. Under 50-user load it has **290–338**, so load creates about 250
+extra threads per process. FastAPI's thread pool (AnyIO's default limit is 40)
+accounts for at most 40 of them. The remaining ~200 match OpenMP teams being
+created by request threads. Setting `OMP_NUM_THREADS=1` is the experiment that
+confirms or rules it out.
 
 ### 9.7 Traffic-meter clamping
 

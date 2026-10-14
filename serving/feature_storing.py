@@ -432,10 +432,23 @@ def record_transaction_outcome(
 PENDING_TTL_SECONDS = 3600
 
 
-def record_pending_route(transaction_id: str, route_id: str, bank: str, network: str) -> None:
+def record_pending_route(
+    transaction_id: str, route_id: str, bank: str, network: str, predicted_probability: float
+) -> None:
+    # predicted_probability travels with the pending decision so /outcome can
+    # compare what the model expected with what actually happened (calibration
+    # monitoring). It is one more field in the same HSET, not an extra call.
     r = get_redis_client()
     key = f"pending:{transaction_id}"
-    r.hset(key, mapping={"route_id": route_id, "bank": bank, "network": network})
+    r.hset(
+        key,
+        mapping={
+            "route_id": route_id,
+            "bank": bank,
+            "network": network,
+            "predicted_probability": predicted_probability,
+        },
+    )
     r.expire(key, PENDING_TTL_SECONDS)
 
 
