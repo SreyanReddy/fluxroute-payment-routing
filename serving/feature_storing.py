@@ -147,14 +147,6 @@ def read_system_tps(now_second: int) -> tuple[float, str | None]:
 def _bucket_key(scope: str, metric: str, minute: int) -> str:
     return f"{scope}:{metric}:{minute}"
 
-
-def record_request(scope: str) -> None:
-    r = get_redis_client()
-    key = _bucket_key(scope, "req", current_minute())
-    r.incr(key)
-    r.expire(key, BUCKET_TTL_SECONDS)
-
-
 def record_outcome(
     scope: str,
     success: bool,
@@ -405,10 +397,6 @@ def build_route_features(
 
 def record_routing_decision(route_id: str, bank: str, network: str, amount: float) -> None:
     """Call exactly once, right after argmax picks the winning route."""
-    record_request(f"route:{route_id}")
-    record_request(f"bank:{bank}")
-    record_request(f"network:{network}")
-    record_request(f"bankroute:{bank}:{route_id}")
     record_bank_amount(bank, amount)
 
 
