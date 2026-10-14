@@ -196,6 +196,13 @@ Getting this split right is the actual insight. Both counters are correct; they
 just answer different questions. "How busy is this route?" counts arrivals.
 "How well is this route performing?" counts completions.
 
+> **Later update (9.10):** the `req` counters were eventually removed. Arrivals
+> are still what load features measure, but they now come from the traffic
+> meter: `system_tps` counts per-second `fr:ingress` arrivals, and
+> `route_utilization` is derived from `system_tps` × the route's fixed routing
+> share. Once nothing read the per-minute `req` keys, writing them was pure
+> overhead.
+
 ### 1.8 Files changed
 
 `serving/feature_storing.py`, three edits:
@@ -1105,7 +1112,62 @@ payments service, though, a dropped routing request is a real defect. The fix
 (uvicorn's `--timeout-keep-alive` longer than nginx's upstream
 `keepalive_timeout`, or the reverse) changes connection behaviour, so it is
 **deferred until after the throughput experiments**, to keep them single-variable.
-*Status: likely cause, pending nginx's error log.*
+*Status: confirmed.* nginx's error log shows exactly one
+`recv() failed (104: Connection reset by peer) while reading response header from upstream`
+for a `POST /route`, which is the signature of the upstream closing a reused
+keepalive connection.
+
+### 9.10 Experiment A — remove unread request counters (`expA_deadwrites`)
+
+**Change:** `record_routing_decision()` wrote four per-minute `<scope>:req:<minute>`
+counters (an `INCR` plus an `EXPIRE` each, so 8 Redis commands per `/route`) that
+nothing reads anymore. Rolling rates moved to `resolved` in Part 1, and
+utilization moved to the traffic meter. The writes and the now-unused
+`record_request()` were deleted. `record_bank_amount()` stays, because
+`get_bank_avg_amount()` reads it.
+
+**Verification before measuring:** `grep` showed no reader of `"req"` in
+`serving/`, and the parity test was unchanged: 22 pass, 4 known gaps, 0 fail
+(of 26 features).
+
+**Prediction:** about 120 Redis commands per route+outcome cycle, so 8 fewer is
+about 7%. Expected a 3–7% throughput gain.
+
+| Users | req/s | p50 | p99 | baseline2 (req/s / p50 / p99) | Δ req/s |
+|---|---|---|---|---|---|
+| 10 | 61.4 | 27 ms | 66 ms | 61.4 / 28 / 72 | 0% (think-time bound) |
+| 25 | 132.1 | 46 ms | 110 ms | 130.9 / 48 / 110 | +0.9% |
+| 50 | **141.1** | 170 ms | 270 ms | 138.9 / 180 / 280 | +1.6% |
+| 100 | 129.0 | 470 ms | 670 ms | 126.9 / 490 / 710 | +1.7% |
+
+| | baseline2 u50 / u100 | expA u50 / u100 |
+|---|---|---|
+| Redis CPU | 40% / 46% | 39% / 42% |
+| App CPU (each) | ~131% / ~132% | ~130% / ~130% |
+| App threads (each) | 306–322 / 578 | 274–306 / 562–578 |
+| fetch p99 | 270 / 886 ms | 272 / 895 ms |
+| scoring p99 | 43 / 87 ms | 43 / 88 ms |
+
+**Result: inside the noise.** Throughput rose 1.5–2%, below the ±3% threshold
+(9.9), so no gain can be claimed. The direction was consistent at every level
+(throughput slightly up, p50 and p99 slightly down), and Redis CPU per request
+fell by about 5–10%, in line with removing ~7% of its commands. So the change
+probably has a small real effect that this setup can't resolve.
+
+Fetch and scoring p99 were unchanged, as expected. The removed writes ran after
+scoring, outside both timers, so this confirms the change touched nothing else.
+App CPU stayed pinned at ~130% and the thread pattern from 9.9 was unchanged.
+
+**What it teaches.** Redis load dropped about as much as the command count
+predicted, but throughput barely moved. So the per-request Python cost is **not
+dominated by issuing Redis commands**. A large share sits elsewhere in the
+request: building the pandas DataFrame, the sklearn preprocessor, pydantic
+validation and response building. That tempers the expectation for experiment
+C. Pipelining removes ~80 round-trips and their GIL handoffs, but it cannot
+remove Python work that isn't part of a round-trip.
+
+The change is kept regardless: it is correct, it reduces Redis load, and parity
+shows the model's inputs are unchanged.
 
 ---
 
