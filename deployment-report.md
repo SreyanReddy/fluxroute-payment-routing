@@ -1458,6 +1458,112 @@ Items **not** on the per-core queue: the nginx/uvicorn keepalive 502 fix
 (correctness, done after this loop), and sweep levels beyond u100 (now part of
 the runbook, A.4).
 
+### 9.15 Experiment C2 — pipelined writes (`expC2_writes`)
+
+**Change:** every write path batched, with the commands unchanged. The traffic
+meter's read and count share one trip (`meter_request()`). The bank-amount
+update and pending record share one trip (`record_routing_decision()`). The
+pending pop is one atomic `MULTI`/`EXEC` trip. All outcome counters share one
+trip, with the failure path's 5-minute read riding along, and a second trip
+only on an actual flag-down. That takes a transaction from ~42 round trips to
+~12.
+
+**Verification before measuring:** the new write-equivalence test
+(`tests/write_parity/`) replayed 1,653 decisions and 1,568 outcomes (199
+failures, 5 flag-down writes, 64 duplicate or unknown outcomes, 59
+never-resolved decisions) through a frozen copy of the old write code and the
+new code. All **1,320 keys matched in type, value and TTL** at every minute
+boundary. Feature parity (22 / 4 / 0) and the traffic-meter check both passed.
+
+**Prediction (9.14):** ~2.4 ms less CPU per transaction (≈ 17 ms) and about
++12–15% saturated throughput.
+
+| Users | req/s | p50 | p99 | CPU ms/txn | expC (req/s / p50 / p99 / CPU) | Δ req/s | Δ CPU/txn |
+|---|---|---|---|---|---|---|---|
+| 10 | 64.9 | 22 ms | 42 ms | 19.0 | 64.2 / 21 / 44 / 19.6 | +1.1% | −0.6 ms |
+| 25 | 152.3 | 27 ms | 69 ms | 16.7 | 144.0 / 27 / 72 / 18.5 | +5.8% | −1.8 ms |
+| 50 | **209.5** | 73 ms | 170 ms | **16.1** | 171.5 / 92 / 200 / 19.2 | **+22.2%** | **−3.1 ms** |
+| 100 | 195.7 | 300 ms | 480 ms | 17.2 | 177.4 / 290 / 480 / 20.0 | +10.3% | −2.8 ms |
+| 150 | 182.8 | 580 ms | 810 ms | 18.6 | (not run) | | |
+
+Server-side p99 (route / fetch / scoring): u10 47 / 23 / 15 ms, u25 56 / 46 /
+18, u50 128 / 98 / 33, u100 393 / 292 / 96, u150 672 / 495 / 224. Redis CPU at
+saturation fell further, to ~17% (from ~25% under C), while serving 18% more.
+There was one failure (u50) in ~127,000 `/route` requests, the keepalive-race
+rate from 9.9.
+
+**Result: the prediction held.** CPU per transaction fell 2.8–3.1 ms at
+saturation (predicted ~2.4). The new peak is **~210 `/route` req/s at u50, +18%
+over C's peak** and **+51% over `baseline2`'s ~139**.
+
+**Why u10 always costs the most per transaction.** In every run, u10 has the
+highest CPU per transaction, and here it barely moved (−0.6 ms). Some app CPU
+is spent per *second*, not per transaction: Prometheus scrapes every 5 s,
+healthchecks every 10 s, and idle thread and event-loop wakeups. At low rates
+that is spread over fewer transactions. CPU frequency scaling probably adds to
+it: a lightly loaded laptop core runs at a lower clock, so the same work takes
+more CPU-seconds. **Compare experiments at u25–u100, not at u10.**
+
+#### Why throughput falls past u50 while CPU doesn't rise
+
+From u50 to u150, throughput falls 13% and `docker stats` shows app CPU
+*slightly lower* at u150 than at u100 (≈ 113–120% against ≈ 116–122%). The
+Prometheus numbers explain it:
+
+| Users | req/s | CPU ms/txn | Total app CPU (req/s × CPU/txn) |
+|---|---|---|---|
+| 50 | 209.5 | 16.1 | **3.37 cores** |
+| 100 | 195.7 | 17.2 | **3.37 cores** |
+| 150 | 182.8 | 18.6 | **3.40 cores** |
+
+**Total CPU is flat at ~3.4 cores (~113% per app) from u50 onwards.** The apps
+are pinned at their ceiling. The small dip in the `docker stats` snapshots is
+snapshot noise around that flat line, not a real drop. What changes is **how
+much each transaction costs**: 16.1 → 17.2 → 18.6 ms. A fixed CPU budget
+divided by a rising cost per transaction gives falling throughput:
+
+```
+throughput = CPU available / CPU per transaction = 3.37 cores / 16.1 ms ≈ 209 req/s
+                                                  = 3.40 cores / 18.6 ms ≈ 183 req/s
+```
+
+The ceiling is **~1.1 cores per process**. One process can only run one thread
+of Python at a time (the GIL), plus a little work outside it. C and C2 removed
+most of the outside work (syscalls, round-trip waiting), which is why
+saturation now sits at ~113% per app rather than ~130%: more of each process's
+time is the GIL-bound Python itself.
+
+The extra cost per transaction above the knee is **coordination overhead.**
+Every concurrent request beyond what one core can serve adds GIL handoffs,
+thread switches and scheduler work, but no useful work. At u150 there is a
+second effect: **each app has reached the thread-pool cap.** PIDS is 45 = 6
+idle + 39 request threads, at AnyIO's 40-thread limit. 150 users over 3
+replicas is 50 concurrent requests per replica, so ~10 per replica wait on the
+event loop for a thread, while the 40 running threads fight over the GIL.
+
+So the **retrograde scaling returned**, and this time for a clear reason. It
+disappeared under C because C's per-transaction cost was dominated by
+round-trip waiting, which overlaps across threads. With round trips mostly
+gone, each request is nearly pure GIL-bound CPU, and piling more threads onto
+one core only adds overhead.
+
+**What follows from this:**
+
+- **The knee is at ~u50** (≈ 15–17 in-flight requests per replica). Load beyond
+  that buys latency, not throughput.
+- **Admission control is a cheap per-core fix.** Capping concurrent requests
+  per process near the knee lets extra load queue (cheaply, in nginx or the
+  event loop) instead of joining the GIL contention. Throughput should then
+  stay flat at the peak instead of declining. Options: a smaller AnyIO thread
+  limiter (e.g. 16 instead of 40), or `max_conns` per upstream server in
+  nginx. This is added to the queue as **E8**.
+- **E7 (concurrency model) matters more now.** With round trips gone, the
+  thread pool's main remaining effect is contention.
+
+| # | Change | What it removes | Verification | Risk / subtlety |
+|---|---|---|---|---|
+| **E8** | **Admission control:** cap concurrent requests per process near the knee (smaller AnyIO thread limiter, or nginx `max_conns` per upstream) | The contention overhead above the knee: CPU/txn rising 16 → 19 ms from u50 to u150 | Sweep through u150. Throughput past u50 should stay flat near the peak, and CPU/txn should stay near its u50 value | Requests over the cap wait in a queue instead, so latency still rises with load, just without wasted CPU. Set the cap too low and the CPU sits idle during the moments when every admitted request is waiting on Redis |
+
 ---
 
 ## Part 10 — What Is Still Not Done

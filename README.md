@@ -1,4 +1,4 @@
-# FluxRoute — Smart Payment Routing
+# FluxRoute: Smart Payment Routing
 
 ML-driven payment gateway routing: given a transaction and several eligible
 PSP routes, predict which route is most likely to succeed and route to it.
@@ -21,8 +21,11 @@ Modeled on the problem described in Razorpay's
 | Offline routing evaluation vs. round-robin baseline | Complete |
 | FastAPI serving layer + Redis feature store | Complete |
 | Train/serve parity test (`tests/parity/`) | 22 exact, 4 documented known gaps, 0 failing |
+| Write-path equivalence test (`tests/write_parity/`) | Passing — 1,320 Redis keys identical (type, value, TTL) |
 | Containerization, 3 replicas behind nginx, Prometheus + Grafana | Complete |
-| Load test harness (Locust) | Built — results pending a recorded run |
+| Load testing + throughput optimization loop | 6 measured runs: **139 → 210 TPS (+51%), 27.4 → 16.1 ms CPU per transaction (−41%)** |
+| Scaling projection to 250k TPS ([`projection.md`](projection.md)) | Written — estimates labeled, with milestones to measure them |
+| Per-core optimization queue (feature cache, pandas-free scoring, …) | Planned — [`deployment-report.md`](deployment-report.md) 9.14 |
 | CacheX integration (custom Redis clone, separate repo) | Planned |
 
 ---
@@ -65,6 +68,44 @@ Comparable on the same model family — on synthetic data against their
 production-scale system, so this is a sanity check on modeling approach, not a
 claim of outperforming their system.
 
+**Serving performance** (3 replicas on one 16-core laptop, Locust sweep at
+10/25/50/100(/150) users; a transaction is one `/route` + one `/outcome`):
+
+| Run | Change | Peak TPS | CPU ms per txn (u50) | p99 at u50 |
+|---|---|---|---|---|
+| baseline2 | instrumented starting point | 138.9 | 27.4 | 280 ms |
+| A | remove Redis counters nothing read | 141.1 | 26.9 | 270 ms |
+| B | `OMP_NUM_THREADS=1` | 140.0 | 27.1 | 280 ms |
+| B2 | single-threaded LightGBM predict | 145.4 | 25.7 | 260 ms |
+| C | pipelined feature reads (~80 → ~8 round trips) | 177.4 | 19.2 | 200 ms |
+| **C2** | **pipelined writes (~42 → ~12 round trips per txn)** | **209.5** | **16.1** | **170 ms** |
+
+One change per run, each measured with an identical procedure (flush, warm-up,
+sweep, Prometheus queried at recorded timestamps) and gated by the parity tests.
+What the measurements showed:
+
+- **The bottleneck was never Redis** (it peaked at ~46% of one core). It was
+  Python's GIL: each replica runs one process, capped at about one core, and
+  ~80 sequential Redis round trips per request meant ~80 waits to re-acquire
+  the GIL behind every other request thread.
+- **Pipelining gained superlinearly.** Removing 8 round trips gained ~1.6%;
+  removing ~72 gained up to +32%, because shorter requests mean fewer threads
+  in flight, which means shorter waits for every remaining handoff.
+- **A training setting leaked into serving.** The model was trained with
+  `n_jobs=-1`, which LightGBM pickles and turns into an explicit 16-thread count
+  on every predict — ~530 threads per replica under load, overriding
+  `OMP_NUM_THREADS`. Fixed at load time with `set_params(n_jobs=1)`.
+- **A round trip costs ~80–90 µs of app CPU even uncontended**, and CPU per
+  transaction (from `process_cpu_seconds_total`) is a far more precise
+  experiment metric than throughput: <1% run-to-run noise vs ±3%.
+- **Past the knee (~u50), throughput falls while total CPU stays flat** — each
+  extra concurrent request adds GIL contention, not work. Admission control at
+  the knee is the next cheap fix.
+
+Full write-up of every run, including predictions that failed and why:
+[`deployment-report.md`](deployment-report.md) Part 9. What it would take to
+reach 250k TPS: [`projection.md`](projection.md).
+
 ---
 
 ## Architecture
@@ -105,9 +146,15 @@ health live rather than static.
 ```
 dataset-generator-routing/   # synthetic data + feature extraction
 ml/                          # training, calibration, cost analysis
-models/                      # serialized model + calibrator
-serving/                     # FastAPI service + Redis feature store
-report.md                    # full engineering log
+models/                      # serialized model + calibrator + serving constants
+serving/                     # FastAPI service + Redis feature store + Dockerfile
+deploy/                      # nginx, Prometheus, Grafana provisioning
+loadtest/                    # Locust scenario + per-run result CSVs
+tests/parity/                # train/serve feature parity (reads)
+tests/write_parity/          # old-vs-new Redis write equivalence (writes)
+report.md                    # ML engineering log
+deployment-report.md         # serving, deployment, load tests, optimization loop
+projection.md                # path from ~210 TPS to 250k+ TPS
 ```
 
 ---
@@ -277,8 +324,12 @@ dataset generator, calls `/route`, then reports a simulated outcome back to
 `/outcome` — so the load test drives the real feedback loop rather than
 hammering a read-only endpoint, and route health actually evolves under load.
 
-> Load-test results are not recorded here yet. Numbers go in this section once
-> a run has actually been performed, and not before.
+Recorded runs use a fixed procedure — `FLUSHALL`, a 2-minute warm-up, then a
+headless sweep at 10/25/50/100/150 users, 3 minutes each, with every level's
+end time logged so Prometheus percentiles and CPU per transaction are queried
+afterwards at exact timestamps. Copy-paste commands are in
+[`deployment-report.md`](deployment-report.md) Appendix A; results are in
+[Results](#results) above.
 
 ### Live traffic meter
 
@@ -377,7 +428,19 @@ training used, so it verifies *formulas*, not *inputs*. Live, the service
 measures its own traffic, which is orders of magnitude below the ~160k TPS
 production stream `system_tps` was trained on. That's a separate problem, handled
 by the scaled traffic meter (see [Live traffic meter](#live-traffic-meter)). It also doesn't exercise the write
-path (how `/outcome` updates Redis), which needs its own test.
+path (how `/outcome` updates Redis); that has its own test.
+
+### Write-path equivalence
+
+`tests/write_parity/` covers the writes. It keeps a frozen copy of the previous
+write code as a referee, replays one seeded stream of ~1,600 routing decisions
+and ~1,600 outcomes through both implementations against separate in-memory
+Redis instances, and requires every key's type, value, and TTL to match at every
+simulated minute. The stream deliberately reaches every branch — failures, a
+route outage that triggers the flag-down write, late outcomes, duplicate and
+unknown outcome reports, decisions that never resolve — and the test refuses to
+pass if any branch went unexercised. It gated the pipelined-writes change
+(1,320 keys identical).
 
 ---
 
@@ -400,6 +463,7 @@ python routing_simulation.py
 python ml/export_serving_constants.py
 pip install -r tests/requirements.txt
 python tests/parity/run_parity.py
+python tests/write_parity/run_write_parity.py
 python tests/traffic_meter_check.py
 
 # Serve (full stack)
@@ -425,10 +489,23 @@ cd serving && uvicorn main:app --reload
 
 ## In Progress / Next
 
-- **Recorded load-test results** — the harness and the full replicated stack are
-  built; p99 latency and throughput figures still need an actual measured run.
-  Target: maximize per-node throughput, then project the cluster needed for
-  250k TPS from measured numbers.
+- **Per-core optimization queue** — profile first (py-spy, E0), then a
+  per-minute in-process feature cache (exact, because every window excludes the
+  current minute), pandas-free scoring, compiled tree inference, local write
+  aggregation, and admission control at the throughput knee. Each one measured
+  as CPU per transaction with the same runbook. Plan and risks:
+  [`deployment-report.md`](deployment-report.md) 9.14–9.15.
+- **Scaling to 250k TPS** — [`projection.md`](projection.md) works it through:
+  the current design can't get there at any hardware budget (hot Redis keys),
+  the data-access redesign that removes that ceiling, and ~500–800 vCPU
+  (optimized Python) or under 100 (compiled hot path) after it — with the
+  milestones that turn each estimate into a measurement.
+- **Keepalive 502 fix** — a rare nginx/uvicorn keepalive race drops ~1 in
+  100k+ requests; fix is uvicorn's keepalive timeout outliving nginx's upstream
+  keepalive. Deferred so the optimization runs stayed single-variable.
+- **More model families** — compare other models against the current LightGBM
+  on the same test week and routing simulation, with serving inference cost as
+  an explicit acceptance criterion alongside ROC-AUC and routing lift.
 - **CacheX swap-in** — replacing Redis with a from-scratch C++ RESP2-compatible
   cache (separate repo), then re-running the identical Locust suite to measure
   the overhead of a hand-written cache vs. production Redis. The Grafana panel
