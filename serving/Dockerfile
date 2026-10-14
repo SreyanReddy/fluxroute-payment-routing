@@ -17,7 +17,8 @@ COPY serving/ /app/serving/
 
 ENV MODEL_PATH=/app/models/lightgbm_tuned_v2.joblib \
     CALIBRATOR_PATH=/app/models/isotonic_calibrator_v2.joblib \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1
 
 WORKDIR /app/serving
 
