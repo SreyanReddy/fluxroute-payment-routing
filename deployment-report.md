@@ -811,6 +811,8 @@ after-run:
        --data-urlencode "time=$(date -d '2026-10-13 22:09:05' +%s)"
    ```
 
+Copy-paste commands for the whole procedure are in **Appendix A**.
+
 Step 4 is deliberate. The first attempt queried Prometheus by hand in the
 browser between levels. Under time pressure, one query was pasted twice, which
 made fetch and scoring p99 look identical at two load levels. Evaluating at
@@ -1019,31 +1021,119 @@ Redis capacity. Candidate changes, roughly by effort:
 9.1, so every gain is attributable to one cause. Each experiment gets its own
 commit and its own `loadtest/<name>_u<N>_stats.csv` files.
 
+### 9.9 Re-baseline on the instrumented code (`baseline2`)
+
+After the first baseline, the service gained observability: structured JSON
+logging (sampled at `LOG_SAMPLE_RATE=0.01`), `/outcome` request counters,
+calibration-monitoring metrics, and finer histogram buckets. That adds a little
+Python work per request, and Python CPU is the bottleneck. So the experiments
+are measured against a fresh baseline on that code, not against 9.3. Otherwise
+the first experiment would silently include two changes.
+
+Commit `c2bb639`, run with the Appendix A runbook (`RUN=baseline2`).
+
+| Users | `/route` req/s | p50 | p95 | p99 | Failures | Baseline 1 (req/s / p50 / p99) |
+|---|---|---|---|---|---|---|
+| 10 | 61.4 | 28 ms | 54 ms | 72 ms | 1 (502) | 59.6 / 31 / 76 |
+| 25 | 130.9 | 48 ms | 89 ms | 110 ms | 0 | 128.4 / 51 / 130 |
+| 50 | **138.9** | 180 ms | 250 ms | 280 ms | 0 | 136.9 / 180 / 320 |
+| 100 | 126.9 | 490 ms | 630 ms | 710 ms | 0 | 125.9 / 500 / 770 |
+
+Server-side p99 at each level's end time:
+
+| Users | `/route` handler | feature fetch | scoring |
+|---|---|---|---|
+| 10 | 67 ms | 49 ms | 15 ms |
+| 25 | 100 ms | 96 ms | 18 ms |
+| 50 | 295 ms | 270 ms | 43 ms |
+| 100 | 742 ms | 886 ms* | 87 ms |
+
+\* Fetch cannot exceed the route handler it is part of. The fetch histogram
+still has a wide 500–1000 ms bucket, so read this one as "roughly 500–750 ms".
+
+**The instrumentation cost nothing measurable, and this sets the noise
+floor.** The curve has the same shape and the same ~138 req/s ceiling, and
+`baseline2` came out 1–2% *faster* despite doing slightly more work. Together
+with the 3% spread between the two warm-ups (9.2), run-to-run noise on this
+laptop is about **±3%**. An experiment has to beat that before its gain counts
+as real.
+
+**The finer buckets corrected one number from 9.3.** Scoring p99 at low load
+is about **15 ms**, not 24 ms. The earlier value was an interpolation inside the
+coarse 10–25 ms bucket. The code was the same; the measurement got sharper. The
+finer route buckets also brought server-side route p99 in line with Locust
+(67 vs 72 ms, 295 vs 280 ms), removing the overshoot noted in 9.3. At
+saturation, fetch is about **90%** of the route p99 (270 of 295 ms at u50).
+
+**Per-level resource use** (`docker stats` snapshot during each level):
+
+| Users | App CPU (each) | App threads (each) | Redis CPU |
+|---|---|---|---|
+| idle | ~0% | 51 | 4% |
+| 10 | 52–59% | 114–130 | 19% |
+| 25 | 112–120% | 178–194 | 34% |
+| 50 | 130–132% | 306–322 | 40% |
+| 100 | 132% | **578** | 46% |
+
+- **App CPU plateaus at ~131% from u50, exactly where throughput plateaus.** This
+  is the per-process ceiling from 9.6: about one GIL-bound core plus work done
+  outside the GIL.
+- **Threads keep climbing after CPU stops, in steps of ~16 = the core count.**
+  (578 − 51) ÷ 16 ≈ 33 request threads at u100, and (306 − 51) ÷ 16 ≈ 16 at
+  u50. FastAPI's thread pool is capped at 40, so it cannot produce 578 threads
+  on its own. One 16-thread OpenMP team per request thread that has called
+  `predict` fits the numbers. Across 3 replicas at u100, that's ~1,700 threads on
+  16 cores. Experiment B (`OMP_NUM_THREADS=1`) should keep thread counts near
+  51 + the thread pool size under any load.
+- **Redis peaks at 46%.** It has not been the bottleneck at any load level.
+
+**Clamping:** `increase(...[13m])` over the sweep is **0**. With the sweep
+started straight after the warm-up, the traffic meter never left the training
+range. (The cold-start clamps after `FLUSHALL` fall in the warm-up, outside the
+window.)
+
+**The one failure: a 502 at u10.** The app logged no `internal_error`, so the
+request never failed inside FastAPI. A 502 is nginx reporting that the upstream
+connection broke. The likely cause is a **keepalive race**: nginx keeps idle
+upstream connections open (`keepalive 128`, and nginx's default
+`keepalive_timeout` is 60 s), while uvicorn closes idle connections after **5 s**.
+If nginx sends a request on a connection at the moment uvicorn closes it, the
+request fails, and nginx does not retry it because POST is not idempotent. Low
+load (u10) leaves connections idle longest, which fits where it happened. The
+rate is 1 in ~90,000 requests, so it doesn't affect the measurements. In a
+payments service, though, a dropped routing request is a real defect. The fix
+(uvicorn's `--timeout-keep-alive` longer than nginx's upstream
+`keepalive_timeout`, or the reverse) changes connection behaviour, so it is
+**deferred until after the throughput experiments**, to keep them single-variable.
+*Status: likely cause, pending nginx's error log.*
+
 ---
 
 ## Part 10 — What Is Still Not Done
 
 Stated plainly so nothing in the repo overstates itself:
 
-1. **Only the baseline has been measured.** Part 9 records it. The README
+1. **Only the baselines have been measured.** Part 9 records them. The README
    section still has a placeholder for the summary.
-2. **Redis pipelining** — now backed by measurement (9.6), and step C of the
+2. **Rare 502s from an nginx/uvicorn keepalive race** (9.9). Fix deferred until
+   after the throughput experiments.
+3. **Redis pipelining** — now backed by measurement (9.6), and step C of the
    throughput plan (9.8).
-3. **CacheX swap-in** — separate repo, not started. The feature-fetch vs.
+4. **CacheX swap-in** — separate repo, not started. The feature-fetch vs.
    scoring latency split exists specifically so this comparison is measurable
    when it happens.
-4. **Closed-loop offline evaluation** — the offline routing simulation still
+5. **Closed-loop offline evaluation** — the offline routing simulation still
    assumes one routing decision doesn't affect future route health. The
    *deployed* service is a genuine closed loop, so load testing measures this
    directly and the offline version matters less than it did.
-5. **Cost-aware ranking** — `/route` maximizes success probability, not expected
+6. **Cost-aware ranking** — `/route` maximizes success probability, not expected
    profit. This matches what Razorpay's paper describes for their production
    system, and their paper lists cost-aware routing as future work too.
-6. **Timezone anchoring** — `hour_of_day` is derived from UTC at serving time,
+7. **Timezone anchoring** — `hour_of_day` is derived from UTC at serving time,
    while the simulator's traffic curve is in unanchored "local" time. Harmless
    on synthetic data; a real deployment would need the serving clock aligned to
    whatever timezone the traffic pattern was learned in.
-7. **No authentication, rate limiting, or TLS.** Appropriate for a portfolio
+8. **No authentication, rate limiting, or TLS.** Appropriate for a portfolio
    project; worth naming as a known gap rather than pretending otherwise.
 
 ---
@@ -1105,3 +1195,147 @@ identical sweep after each: remove dead Redis writes, pin OpenMP to one thread,
 then pipeline the Redis reads so ~80 GIL handoffs become one. Only then add
 replicas. After that, swap Redis for the C++ cache I'm building and re-run the
 identical load test to measure the difference.
+
+---
+
+## Appendix A — Load-Test Runbook
+
+The procedure from 9.1 as copy-paste commands. Every run, baseline or
+experiment, uses exactly these steps, so results stay comparable. Run
+everything from the project root.
+
+### A.1 Name the run
+
+One name per run. It prefixes every output file:
+
+```bash
+RUN=baseline2        # later: expA_deadwrites, expB_omp, expC_pipeline, ...
+```
+
+`RUN` only exists in the terminal where you set it. If you open a new terminal,
+set it again.
+
+### A.2 Pre-flight (every time)
+
+```bash
+cd /media/sreyan/D/01_Dev/Projects/FluxRoute
+source .venv-load/bin/activate
+```
+
+```bash
+git status                          # code under test must be committed
+git rev-parse --short HEAD          # record this hash with the results
+```
+
+```bash
+docker compose up -d --build        # no-op if nothing changed; rebuilds if serving/ did
+docker compose ps                   # 7 containers Up; redis + app1-3 (healthy)
+```
+
+```bash
+curl -s -w '\n' -X POST localhost:8080/route -H 'Content-Type: application/json' \
+  -d '{"amount":1200,"bank":"HDFC","network":"Visa","payment_method":"CARD","merchant":"Shopping","device":"Android","risk":"LOW"}'
+```
+
+The smoke test must return a 200 with a `chosen_route_id` before any load is
+applied (see 9.2, the discarded run).
+
+### A.3 Reset and warm up (not recorded)
+
+```bash
+docker compose exec redis redis-cli FLUSHALL
+```
+
+```bash
+locust -f loadtest/locustfile.py --host http://localhost:8080 --headless \
+  -u 50 -r 10 -t 2m --only-summary
+```
+
+Start the sweep **immediately** after the warm-up. A gap of more than 60 s
+empties the traffic meter's window and causes cold-start clamping (9.7).
+
+### A.4 The sweep (about 13 minutes)
+
+```bash
+rm -f loadtest/${RUN}_endtimes.txt
+for u in 10 25 50 100; do
+  locust -f loadtest/locustfile.py --host http://localhost:8080 --headless \
+    -u $u -r $(( u < 25 ? u : 25 )) -t 3m --csv loadtest/${RUN}_u$u --only-summary
+  echo "$u $(date +%s)" >> loadtest/${RUN}_endtimes.txt
+done
+```
+
+The four levels run back to back with no gaps. After each level ends, its user
+count and Unix end time are appended to `loadtest/${RUN}_endtimes.txt`, which
+A.5 uses to query Prometheus.
+
+Optional, in a second terminal during the u50 level (minutes 3.5–6 of the
+sweep):
+
+```bash
+docker stats --no-stream
+```
+
+### A.5 Collect the results
+
+**Client side (Locust):** req/s, p50, p95, p99 and failures per level:
+
+```bash
+for u in 10 25 50 100; do
+  awk -F, -v u=$u '$2=="POST /route" {printf "u%-4s req/s=%6.1f  p50=%4s  p95=%4s  p99=%4s  fails=%s\n", u, $10, $12, $17, $19, $4}' \
+    loadtest/${RUN}_u${u}_stats.csv
+done
+```
+
+**Server side (Prometheus):** p99 of route handler, fetch and scoring,
+evaluated at each level's end time over its last 2 minutes. Values are in
+seconds:
+
+```bash
+while read u t; do
+  for m in route_latency_seconds feature_fetch_seconds scoring_latency_seconds; do
+    printf 'u%-4s %-25s ' "$u" "$m"
+    curl -s localhost:9090/api/v1/query \
+      --data-urlencode "query=histogram_quantile(0.99, sum by (le) (rate(fluxroute_${m}_bucket[2m])))" \
+      --data-urlencode "time=$t" | grep -o '"[^"]*"\]'
+  done
+done < loadtest/${RUN}_endtimes.txt
+```
+
+**Traffic-meter clamping** over the whole sweep (an empty result means no
+clamping). The 13-minute window covers the ~12-minute sweep plus the end of the
+warm-up, but not the warm-up's cold start, which always clamps right after
+`FLUSHALL`:
+
+```bash
+curl -s localhost:9090/api/v1/query \
+  --data-urlencode 'query=sum by (direction) (increase(fluxroute_system_tps_clamped_total[13m]))' \
+  --data-urlencode "time=$(tail -1 loadtest/${RUN}_endtimes.txt | cut -d' ' -f2)"
+```
+
+Prometheus keeps 15 days of data by default, so these A.5 queries can be re-run
+later, as long as the Prometheus container hasn't been removed.
+`docker compose down` removes it and its data.
+
+### A.6 Record and commit
+
+Add the results to the report, then commit only the summary files:
+
+```bash
+git add loadtest/${RUN}_u*_stats.csv loadtest/${RUN}_endtimes.txt deployment-report.md
+git commit -m "Load test: ${RUN}"
+```
+
+Locust's `_stats_history.csv`, `_failures.csv` and `_exceptions.csv` files are
+left uncommitted. The history file is large, and the other two are empty when
+the run is clean (and if they aren't, the run isn't valid anyway).
+
+### A.7 Experiment discipline
+
+- **One change per experiment.** Each experiment gets its own commit, so every
+  measured difference has exactly one cause.
+- **Compare against the run immediately before it,** not only against the
+  original baseline. Improvements stack, and each step's gain should be
+  measured on its own.
+- **Same host conditions:** close heavy applications (browsers with many tabs,
+  IDE indexing, other containers) before a run. They all share the same CPU.
