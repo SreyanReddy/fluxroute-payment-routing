@@ -176,67 +176,76 @@ def record_outcome(
         r.expire(key, BUCKET_TTL_SECONDS)
 
 
-def sum_window(scope: str, metric: str, window_minutes: int) -> float:
+# Readers are split into "which keys" and "math on the values", with no Redis
+# access in either, so build_route_features() can queue every read on one
+# pipeline and do the math afterwards.
+
+def _window_keys(scope: str, metric: str, window_minutes: int, now: int) -> list[str]:
     """
-    Sum the trailing `window_minutes` buckets, EXCLUDING the current
-    minute -- matches prior_rolling_sum()'s convention offline.
+    The trailing `window_minutes` bucket keys, EXCLUDING the current minute --
+    matches prior_rolling_sum()'s convention offline. Order matters: summing
+    the values in a different order can change the float result.
     """
-    r = get_redis_client()
-    now = current_minute()
-    keys = [_bucket_key(scope, metric, now - offset) for offset in range(1, window_minutes + 1)]
-    values = r.mget(keys)
+    return [_bucket_key(scope, metric, now - offset) for offset in range(1, window_minutes + 1)]
+
+
+def _sum_values(values) -> float:
+    """Missing buckets (None) count as nothing."""
     return sum(float(v) for v in values if v is not None)
 
 
-def get_rolling_rate(scope: str, window_minutes: int) -> tuple[float | None, float]:
+def _rate(resolved: float, successes: float) -> float | None:
     """
-    Returns (success_rate_or_None, resolved_count).
-
     The denominator is RESOLVED outcomes, not requests. A request is counted
     when the routing decision is made, but its success is only counted when
     /outcome arrives -- dividing by requests would count every in-flight
     transaction as a failure and bias every route's rate downward.
     """
-    resolved = sum_window(scope, "resolved", window_minutes)
-    successes = sum_window(scope, "succ", window_minutes)
     if resolved <= 0:
-        return None, 0.0
-    return successes / resolved, resolved
+        return None
+    return successes / resolved
 
 
-def failure_rate_over_last_active_minutes(scope: str, before_minute: int) -> float:
+def _avg_latency(resolved: float, latency_sum: float) -> float | None:
+    if resolved <= 0:
+        return None
+    return latency_sum / resolved
+
+
+def _active_minute_keys(scope: str, metric: str, minutes: list) -> list[str]:
+    return [_bucket_key(scope, metric, int(m)) for m in minutes]
+
+
+def _active_failure_rate(resolved_values, success_values) -> float:
     """
-    Failure rate over the last ACTIVE_RECORDS minutes, before `before_minute`,
-    in which this scope had any resolved transaction.
+    Failure rate over the last ACTIVE_RECORDS minutes in which the scope had
+    any resolved transaction (the minutes come from the scope's `active` set).
 
     This is how training computed bank_failure_rate_5m and
     network_failure_rate_5m: engineer_features() rolls over minutes that had
     transactions, not clock minutes. At quiet times the last 5 active minutes
     can reach far back, while the last 5 clock minutes may be nearly empty.
-    Returns NaN when there is no earlier active minute, as training does.
+    Returns NaN when the minutes hold no resolved transactions, as training does.
     """
-    r = get_redis_client()
-    minutes = r.zrevrangebyscore(
-        f"{scope}:active", before_minute - 1, "-inf", start=0, num=ACTIVE_RECORDS
-    )
-    if not minutes:
-        return float("nan")
-
-    resolved = r.mget([_bucket_key(scope, "resolved", int(m)) for m in minutes])
-    successes = r.mget([_bucket_key(scope, "succ", int(m)) for m in minutes])
-    total = sum(float(v) for v in resolved if v is not None)
+    total = _sum_values(resolved_values)
     if total <= 0:
         return float("nan")
-    succeeded = sum(float(v) for v in successes if v is not None)
+    succeeded = _sum_values(success_values)
     return (total - succeeded) / total
 
 
-def get_rolling_avg_latency(scope: str, window_minutes: int) -> float | None:
+def sum_window(scope: str, metric: str, window_minutes: int) -> float:
+    """Sum the trailing `window_minutes` buckets, EXCLUDING the current minute."""
+    keys = _window_keys(scope, metric, window_minutes, current_minute())
+    return _sum_values(get_redis_client().mget(keys))
+
+
+def get_rolling_rate(scope: str, window_minutes: int) -> tuple[float | None, float]:
+    """Returns (success_rate_or_None, resolved_count). See _rate()."""
     resolved = sum_window(scope, "resolved", window_minutes)
-    latency_sum = sum_window(scope, "lat", window_minutes)
-    if resolved <= 0:
-        return None
-    return latency_sum / resolved
+    successes = sum_window(scope, "succ", window_minutes)
+    rate = _rate(resolved, successes)
+    return rate, (resolved if rate is not None else 0.0)
 
 
 # ============================================================
@@ -247,32 +256,21 @@ def mark_route_flagged_down(route_id: str) -> None:
     get_redis_client().set(f"route:{route_id}:last_flagged_minute", current_minute())
 
 
-def minutes_since_route_flagged(route_id: str) -> float:
-    value = get_redis_client().get(f"route:{route_id}:last_flagged_minute")
-    if value is None:
-        return float(NO_FAILURE_SENTINEL)
-    return float(current_minute() - int(value))
-
-
 def mark_bank_route_success(bank: str, route_id: str) -> None:
     get_redis_client().set(f"bankroute:{bank}:{route_id}:last_success_minute", current_minute())
 
 
-def minutes_since_bank_route_success(bank: str, route_id: str) -> float:
-    value = get_redis_client().get(f"bankroute:{bank}:{route_id}:last_success_minute")
-    if value is None:
+def _minutes_since(stored_minute, now: int) -> float:
+    if stored_minute is None:
         return float(NO_FAILURE_SENTINEL)
-    return float(current_minute() - int(value))
+    return float(now - int(stored_minute))
 
 
 # ============================================================
 # PRIMITIVE 3: cumulative running average (bank amount baseline)
 # ============================================================
 
-def get_bank_avg_amount(bank: str) -> float | None:
-    r = get_redis_client()
-    total = r.get(f"bank:{bank}:amount_sum")
-    count = r.get(f"bank:{bank}:amount_count")
+def _bank_avg(total, count) -> float | None:
     if total is None or count is None or float(count) <= 0:
         return None
     return float(total) / float(count)
@@ -299,19 +297,89 @@ def build_route_features(
     incoming transaction, during scoring -- before a routing decision
     is made. No Redis writes happen here.
 
+    All reads go out in two pipelined round trips instead of one round trip
+    each. The second exists only because the bank and network failure rates
+    must first learn WHICH minutes were active before reading their counters.
+
     system_tps is the traffic-meter reading from read_system_tps(), taken
     once per request and shared by every candidate route.
     """
+    # One clock reading for every key, so a request that straddles a minute
+    # boundary can't read some windows from one minute and some from the next.
     now = current_minute()
     config = ROUTE_STATIC_CONFIG[route_id]
 
     day_in_week = (now // (24 * 60)) % 7
     hour_of_day = (now % (24 * 60)) // 60
 
-    success_rate_5m, _ = get_rolling_rate(f"route:{route_id}", WINDOW_5M)
-    success_rate_15m, _ = get_rolling_rate(f"route:{route_id}", WINDOW_15M)
-    avg_latency_5m = get_rolling_avg_latency(f"route:{route_id}", WINDOW_5M)
-    failure_rate_1m, _ = get_rolling_rate(f"route:{route_id}", 1)
+    route_scope = f"route:{route_id}"
+    bank_scope = f"bank:{bank}"
+    network_scope = f"network:{network}"
+    bank_route_scope = f"bankroute:{bank}:{route_id}"
+
+    r = get_redis_client()
+
+    # Round trip 1: every read that doesn't depend on another reply.
+    # transaction=False is plain batching; these reads never needed atomicity.
+    pipe = r.pipeline(transaction=False)
+    pipe.mget(_window_keys(route_scope, "resolved", WINDOW_5M, now))
+    pipe.mget(_window_keys(route_scope, "succ", WINDOW_5M, now))
+    pipe.mget(_window_keys(route_scope, "resolved", WINDOW_15M, now))
+    pipe.mget(_window_keys(route_scope, "succ", WINDOW_15M, now))
+    pipe.mget(_window_keys(route_scope, "resolved", WINDOW_5M, now))
+    pipe.mget(_window_keys(route_scope, "lat", WINDOW_5M, now))
+    pipe.mget(_window_keys(route_scope, "resolved", 1, now))
+    pipe.mget(_window_keys(route_scope, "succ", 1, now))
+    pipe.zrevrangebyscore(f"{bank_scope}:active", now - 1, "-inf", start=0, num=ACTIVE_RECORDS)
+    pipe.zrevrangebyscore(f"{network_scope}:active", now - 1, "-inf", start=0, num=ACTIVE_RECORDS)
+    pipe.mget(_window_keys(bank_route_scope, "resolved", WINDOW_15M, now))
+    pipe.mget(_window_keys(bank_route_scope, "succ", WINDOW_15M, now))
+    pipe.get(f"route:{route_id}:last_flagged_minute")
+    pipe.get(f"bankroute:{bank}:{route_id}:last_success_minute")
+    pipe.get(f"bank:{bank}:amount_sum")
+    pipe.get(f"bank:{bank}:amount_count")
+
+    # Replies come back in queue order: keep this list in step with the queue.
+    (
+        resolved_5m, succ_5m,
+        resolved_15m, succ_15m,
+        latency_resolved_5m, latency_5m,
+        resolved_1m, succ_1m,
+        bank_active_minutes, network_active_minutes,
+        bank_route_resolved, bank_route_succ,
+        last_flagged_minute, last_bank_route_success_minute,
+        bank_amount_sum, bank_amount_count,
+    ) = pipe.execute()
+
+    # Round trip 2: counters for the active minutes found above. A scope with
+    # no active minutes queues nothing and its rate is NaN, as in training.
+    # With nothing queued at all, execute() returns [] without a round trip.
+    pipe = r.pipeline(transaction=False)
+    if bank_active_minutes:
+        pipe.mget(_active_minute_keys(bank_scope, "resolved", bank_active_minutes))
+        pipe.mget(_active_minute_keys(bank_scope, "succ", bank_active_minutes))
+    if network_active_minutes:
+        pipe.mget(_active_minute_keys(network_scope, "resolved", network_active_minutes))
+        pipe.mget(_active_minute_keys(network_scope, "succ", network_active_minutes))
+    active_replies = pipe.execute()
+
+    bank_failure_rate_5m = float("nan")
+    network_failure_rate_5m = float("nan")
+    next_reply = 0
+    if bank_active_minutes:
+        bank_failure_rate_5m = _active_failure_rate(
+            active_replies[next_reply], active_replies[next_reply + 1]
+        )
+        next_reply += 2
+    if network_active_minutes:
+        network_failure_rate_5m = _active_failure_rate(
+            active_replies[next_reply], active_replies[next_reply + 1]
+        )
+
+    success_rate_5m = _rate(_sum_values(resolved_5m), _sum_values(succ_5m))
+    success_rate_15m = _rate(_sum_values(resolved_15m), _sum_values(succ_15m))
+    avg_latency_5m = _avg_latency(_sum_values(latency_resolved_5m), _sum_values(latency_5m))
+    failure_rate_1m = _rate(_sum_values(resolved_1m), _sum_values(succ_1m))
     if failure_rate_1m is not None:
         failure_rate_1m = 1.0 - failure_rate_1m
 
@@ -322,20 +390,17 @@ def build_route_features(
     # feature describe the model's own choices, which training never showed.
     route_utilization = system_tps * config["routing_share"] / config["base_capacity_tps"]
 
-    bank_failure_rate_5m = failure_rate_over_last_active_minutes(f"bank:{bank}", now)
-    network_failure_rate_5m = failure_rate_over_last_active_minutes(f"network:{network}", now)
-
-    bank_route_resolved_15m = sum_window(f"bankroute:{bank}:{route_id}", "resolved", WINDOW_15M)
-    bank_route_successes_15m = sum_window(f"bankroute:{bank}:{route_id}", "succ", WINDOW_15M)
+    bank_route_resolved_15m = _sum_values(bank_route_resolved)
+    bank_route_successes_15m = _sum_values(bank_route_succ)
     prior = config["base_success_rate"]
     bank_route_success_rate_15m = (
         bank_route_successes_15m + BANK_ROUTE_SHRINK_K * prior
     ) / (bank_route_resolved_15m + BANK_ROUTE_SHRINK_K)
 
-    time_since_last_failure = minutes_since_route_flagged(route_id)
-    time_since_last_bank_route_success = minutes_since_bank_route_success(bank, route_id)
+    time_since_last_failure = _minutes_since(last_flagged_minute, now)
+    time_since_last_bank_route_success = _minutes_since(last_bank_route_success_minute, now)
 
-    bank_avg_amount = get_bank_avg_amount(bank)
+    bank_avg_amount = _bank_avg(bank_amount_sum, bank_amount_count)
     amount_to_bank_avg_ratio = amount / bank_avg_amount if bank_avg_amount else 1.0
 
     # Cold-start fallbacks: no traffic history yet -> use static baselines.

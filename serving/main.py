@@ -49,6 +49,10 @@ app = FastAPI(title="FluxRoute Smart Payment Routing")
 
 _artifact = joblib.load(MODEL_PATH)
 _model = _artifact["model"]
+# Trained with n_jobs=-1, which LightGBM turns into an explicit 16-thread count
+# on every predict, overriding OMP_NUM_THREADS. Scoring 4 rows from many
+# concurrent request threads wants 1.
+_model.set_params(n_jobs=1)
 _preprocessor = _artifact["preprocessor"]
 _calibrator = joblib.load(CALIBRATOR_PATH)
 _feature_columns = _artifact["numeric_features"] + _artifact["categorical_features"]

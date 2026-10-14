@@ -985,7 +985,7 @@ request threads can create hundreds of OpenMP threads per process. That matches
 the ~300 PIDS per app container: roughly 900 threads competing for 16 cores, to
 score 4 rows each. Pandas overhead on tiny DataFrames (the `DataFrame` build,
 column selection and the sklearn preprocessor) likely contributes too.
-*Status: strongly supported, not yet confirmed.* At idle each app container has
+*Status: confirmed by experiment B2 (9.12).* At idle each app container has
 **51** threads. Under 50-user load it has **290–338**, so load creates about 250
 extra threads per process. FastAPI's thread pool (AnyIO's default limit is 40)
 accounts for at most 40 of them. The remaining ~200 match OpenMP teams being
@@ -1091,7 +1091,8 @@ saturation, fetch is about **90%** of the route p99 (270 of 295 ms at u50).
   on its own. One 16-thread OpenMP team per request thread that has called
   `predict` fits the numbers. Across 3 replicas at u100, that's ~1,700 threads on
   16 cores. (Experiment B tested this with `OMP_NUM_THREADS=1` and found that
-  the environment variable doesn't reach the predict path. See 9.11.)
+  the environment variable doesn't reach the predict path. See 9.11. Experiment
+  B2 confirmed it: see 9.12.)
 - **Redis peaks at 46%.** It has not been the bottleneck at any load level.
 
 **Clamping:** `increase(...[13m])` over the sweep is **0**. With the sweep
@@ -1218,6 +1219,58 @@ setting. `n_jobs=-1` is right for training on a big batch and wrong for scoring
 `OMP_NUM_THREADS=1` stays in the image. It is harmless, removes 45 idle threads
 per replica, and keeps numpy's thread pool from oversubscribing once scoring is
 single-threaded. The actual fix is experiment B2.
+
+### 9.12 Experiment B2 — single-threaded scoring (`expB2_njobs`)
+
+**Change:** `_model.set_params(n_jobs=1)` right after the model is loaded in
+`serving/main.py`, so every `predict_proba` passes `num_threads=1`. Predictions
+are unchanged: LightGBM parallelizes over rows, and each row's score is computed
+identically regardless of thread count.
+
+| Users | req/s | p50 | p99 | expB (req/s / p50 / p99) | Δ req/s vs expB | Δ req/s vs baseline2 |
+|---|---|---|---|---|---|---|
+| 10 | 61.6 | 27 ms | 62 ms | 61.7 / 27 / 63 | 0% (think-time bound) | 0% |
+| 25 | 134.8 | 44 ms | 99 ms | 132.4 / 46 / 110 | +1.8% | +3.0% |
+| 50 | **145.4** | 160 ms | 260 ms | 140.0 / 170 / 280 | **+3.9%** | **+4.7%** |
+| 100 | 134.8 | 450 ms | 630 ms | 129.3 / 470 / 670 | **+4.3%** | **+6.2%** |
+
+| Users | scoring p99, expB → B2 | fetch p99 (B2) | App threads, expB → B2 | App CPU (B2) |
+|---|---|---|---|---|
+| idle | | | 6 → 6 | ~4% |
+| 10 | 14.7 → 14.8 ms | 48 ms | 53–69 → **8** | 41–48% |
+| 25 | 17.6 → 15.6 ms | 96 ms | 117 → **12–13** | 100–114% |
+| 50 | 43.4 → **19.9 ms** | 272 ms | 261–277 → **20–21** | ~128% |
+| 100 | 87.5 → **43.9 ms** | 834 ms* | 517–533 → **37–45** | 128–134% |
+
+\* The wide 500–1000 ms fetch bucket again; read it as "roughly 500–700 ms".
+
+**Result: the first gain above the noise floor, and the thread hypothesis is
+confirmed.**
+
+- **Threads:** the load-driven thread explosion is gone. At u100, each app
+  peaks at 37–45 threads, which is 6 idle plus up to 40 request threads (AnyIO's
+  thread-pool limit). The 9.9 hypothesis is **confirmed**: each request thread
+  that called `predict` had its own 16-thread OpenMP team.
+- **Throughput:** +3.9% at u50 and +4.3% at u100 versus expB, both above the
+  ±3% threshold, and consistent at every saturated level. The ceiling is now
+  ~145 `/route` req/s (+4.7% over `baseline2`).
+- **Scoring under load halved** (43 → 20 ms at u50, 88 → 44 ms at u100). That is
+  the coordination and oversubscription cost that has now been removed.
+- **Scoring at low load did not move (~15 ms).** So the ~15 ms floor is not
+  OpenMP. It is the rest of the scoring block: selecting DataFrame columns, the
+  sklearn preprocessor's `transform`, and LightGBM's input conversion, all
+  Python/pandas overhead on a 4-row frame. That is a separate future target.
+
+**What did not change:**
+
+- **App CPU still caps at ~130%.** The GIL ceiling is untouched. The gain came
+  from wasting less of that one core on thread coordination, not from using
+  more cores.
+- **Retrograde scaling remains:** 145.4 → 134.8 req/s from u50 to u100 (−7%,
+  against −8% before). So it was never caused by OpenMP. It is contention among
+  the request threads themselves.
+- **Fetch is now ~94% of route p99 at saturation** (272 of 289 ms at u50). It is
+  the dominant cost by far, which makes pipelining (C) the next target.
 
 ---
 
