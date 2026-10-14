@@ -20,13 +20,11 @@ sys.path.insert(0, THIS_DIR)
 
 from feature_storing import (  # noqa: E402
     current_second,
-    read_system_tps,
-    record_ingress,
+    meter_request,
     get_eligible_routes,
     build_route_features,
     record_routing_decision,
     record_transaction_outcome,
-    record_pending_route,
     pop_pending_route,
     get_redis_client,
 )
@@ -261,8 +259,7 @@ def route_transaction(request: RouteRequest) -> RouteResponse:
     fetch_started = time.perf_counter()
 
     now_second = current_second()
-    system_tps, clamp = read_system_tps(now_second)
-    record_ingress(now_second)
+    system_tps, clamp = meter_request(now_second)
     SYSTEM_TPS.labels(instance=INSTANCE_ID).set(system_tps)
     if clamp is not None:
         SYSTEM_TPS_CLAMPED.labels(instance=INSTANCE_ID, direction=clamp).inc()
@@ -302,13 +299,12 @@ def route_transaction(request: RouteRequest) -> RouteResponse:
     )
 
     record_routing_decision(
+        transaction_id=transaction_id,
         route_id=chosen_route_id,
         bank=request.bank,
         network=request.network,
         amount=request.amount,
-    )
-    record_pending_route(
-        transaction_id, chosen_route_id, request.bank, request.network, chosen_probability
+        predicted_probability=chosen_probability,
     )
 
     total_seconds = time.perf_counter() - started

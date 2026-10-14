@@ -975,7 +975,8 @@ round-trip latency queueing inside Redis. The data rules that out: Redis is at
 At saturation, the 3 replicas served ~137 `/route` + ~137 `/outcome` req/s on
 about 3 cores of Python. That works out to **roughly 20 ms of single-core Python
 CPU per route+outcome cycle**, and that number is what any efficiency fix has
-to reduce.
+to reduce. *(Later measured directly with `process_cpu_seconds_total`: 26–30 ms
+at `baseline2`. See 9.14.)*
 
 **Second finding: scoring is not sub-millisecond.** Part 8 predicted scoring
 "likely sub-millisecond". It is 24 ms at p99 even at low load. A prime suspect
@@ -1373,6 +1374,42 @@ because of hot keys. An optimized Python design needs roughly 420–830 cores.
 transaction (Appendix A.5), alongside the usual throughput and p99. A change
 that keeps throughput flat but lowers CPU per transaction is a win, because it
 frees capacity that a sweep on one laptop can't show.
+
+**CPU per transaction, all runs so far** (ms of app CPU per routed transaction,
+from `process_cpu_seconds_total`, evaluated afterwards at each level's end
+time):
+
+| Run | u10 | u25 | u50 | u100 |
+|---|---|---|---|---|
+| baseline2 | 26.0 | 25.5 | 27.4 | 30.4 |
+| expA_deadwrites | 25.9 | 25.1 | 26.9 | 29.6 |
+| expB_omp | 25.8 | 25.1 | 27.1 | 29.6 |
+| expB2_njobs | 24.4 | 24.0 | 25.7 | 27.8 |
+| **expC_pipeline** | **19.6** | **18.5** | **19.2** | **20.0** |
+
+What this metric shows that throughput couldn't:
+
+- **It is far less noisy.** expB changed nothing on the request path, and it
+  matches expA within ~0.2 ms (under 1%) at every level, against ±3% for
+  throughput. Smaller improvements are now measurable.
+- **Most of the cost is base work, not contention.** Even at u10, with almost
+  no contention, `baseline2` spent ~26 ms per transaction. Contention added
+  only ~4 ms at u100. (This corrects 9.6's estimate of "roughly 20 ms", which
+  came from `docker stats` snapshots. The measured baseline is 26–30 ms.)
+- **A round trip costs roughly 80–90 µs of app CPU even uncontended.** C
+  removed ~72 round trips and saved ~6 ms per transaction at u10 (24.4 → 19.6).
+  That's the client-side cost of issuing one command: redis-py encoding, two
+  socket syscalls, parsing the reply, and releasing and reacquiring the GIL.
+- **C flattened the contention penalty.** From u10 to u100, CPU per
+  transaction rose 3.4 ms under B2 but only 0.4 ms under C. That is the
+  superlinear effect from 9.13 seen directly.
+- **B2 saved ~1.3–1.8 ms** (OpenMP coordination per predict). A saved
+  0.1–0.8 ms, consistent with 8 round trips at ~80 µs.
+
+**C2 prediction from this:** C2 removes ~30 round trips per transaction
+(~5 from `/route`, ~25 from `/outcome`). At ~80 µs each, that is **~2.4 ms**, so
+expect **~17 ms per transaction** (from 18.5–20). If the service stays CPU-bound,
+the saturated throughput should rise by roughly the same ratio, **~+12–15%**.
 
 #### C2 — pipeline the writes (next)
 

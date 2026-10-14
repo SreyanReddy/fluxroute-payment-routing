@@ -110,27 +110,13 @@ def current_minute() -> int:
     return current_second() // 60
 
 
-def record_ingress(second: int) -> None:
-    """Count one arriving request in its second's bucket."""
-    r = get_redis_client()
-    key = f"fr:ingress:sec:{second}"
-    r.incr(key)
-    r.expire(key, INGRESS_TTL_SECONDS)
+def _ingress_window_keys(now_second: int) -> list[str]:
+    # The current second is excluded, so a request never counts itself.
+    return [f"fr:ingress:sec:{now_second - k}" for k in range(1, INGRESS_WINDOW_SECONDS + 1)]
 
 
-def read_system_tps(now_second: int) -> tuple[float, str | None]:
-    """
-    Requests per second over the last 60 completed seconds, scaled up to
-    production size and clamped to the range training saw.
-
-    The current second is excluded, so a request never counts itself.
-    Read it once per request: every candidate route gets the same value.
-
-    Returns (system_tps, clamp) where clamp is "low", "high", or None.
-    """
-    r = get_redis_client()
-    keys = [f"fr:ingress:sec:{now_second - k}" for k in range(1, INGRESS_WINDOW_SECONDS + 1)]
-    requests = sum(float(v) for v in r.mget(keys) if v is not None)
+def _system_tps_from(values) -> tuple[float, str | None]:
+    requests = sum(float(v) for v in values if v is not None)
     observed = requests / INGRESS_WINDOW_SECONDS * TRAFFIC_SCALE
 
     if observed < SYSTEM_TPS_MIN:
@@ -140,6 +126,33 @@ def read_system_tps(now_second: int) -> tuple[float, str | None]:
     return observed, None
 
 
+def read_system_tps(now_second: int) -> tuple[float, str | None]:
+    """
+    Requests per second over the last 60 completed seconds, scaled up to
+    production size and clamped to the range training saw.
+
+    Read it once per request: every candidate route gets the same value.
+
+    Returns (system_tps, clamp) where clamp is "low", "high", or None.
+    """
+    return _system_tps_from(get_redis_client().mget(_ingress_window_keys(now_second)))
+
+
+def meter_request(now_second: int) -> tuple[float, str | None]:
+    """
+    read_system_tps(), then count this request in the meter -- in one round
+    trip. The read covers only completed seconds and the count lands in the
+    current second, so sending both together can't make a request see itself.
+    """
+    key = f"fr:ingress:sec:{now_second}"
+    pipe = get_redis_client().pipeline(transaction=False)
+    pipe.mget(_ingress_window_keys(now_second))
+    pipe.incr(key)
+    pipe.expire(key, INGRESS_TTL_SECONDS)
+    window_values, _, _ = pipe.execute()
+    return _system_tps_from(window_values)
+
+
 # ============================================================
 # PRIMITIVE 1: minute-bucketed counters
 # ============================================================
@@ -147,33 +160,33 @@ def read_system_tps(now_second: int) -> tuple[float, str | None]:
 def _bucket_key(scope: str, metric: str, minute: int) -> str:
     return f"{scope}:{metric}:{minute}"
 
-def record_outcome(
+def _queue_outcome(
+    pipe,
     scope: str,
+    minute: int,
     success: bool,
     latency_ms: float | None = None,
     track_active: bool = False,
 ) -> None:
-    r = get_redis_client()
-    minute = current_minute()
-
+    """Queue one scope's outcome counters on `pipe`; the caller executes it."""
     if track_active:
         active_key = f"{scope}:active"
-        r.zadd(active_key, {minute: minute})
-        r.zremrangebyscore(active_key, "-inf", minute - ACTIVE_RETENTION_MINUTES)
+        pipe.zadd(active_key, {minute: minute})
+        pipe.zremrangebyscore(active_key, "-inf", minute - ACTIVE_RETENTION_MINUTES)
 
     resolved_key = _bucket_key(scope, "resolved", minute)
-    r.incr(resolved_key)
-    r.expire(resolved_key, BUCKET_TTL_SECONDS)
+    pipe.incr(resolved_key)
+    pipe.expire(resolved_key, BUCKET_TTL_SECONDS)
 
     if success:
         key = _bucket_key(scope, "succ", minute)
-        r.incr(key)
-        r.expire(key, BUCKET_TTL_SECONDS)
+        pipe.incr(key)
+        pipe.expire(key, BUCKET_TTL_SECONDS)
 
     if latency_ms is not None:
         key = _bucket_key(scope, "lat", minute)
-        r.incrbyfloat(key, latency_ms)
-        r.expire(key, BUCKET_TTL_SECONDS)
+        pipe.incrbyfloat(key, latency_ms)
+        pipe.expire(key, BUCKET_TTL_SECONDS)
 
 
 # Readers are split into "which keys" and "math on the values", with no Redis
@@ -234,31 +247,10 @@ def _active_failure_rate(resolved_values, success_values) -> float:
     return (total - succeeded) / total
 
 
-def sum_window(scope: str, metric: str, window_minutes: int) -> float:
-    """Sum the trailing `window_minutes` buckets, EXCLUDING the current minute."""
-    keys = _window_keys(scope, metric, window_minutes, current_minute())
-    return _sum_values(get_redis_client().mget(keys))
-
-
-def get_rolling_rate(scope: str, window_minutes: int) -> tuple[float | None, float]:
-    """Returns (success_rate_or_None, resolved_count). See _rate()."""
-    resolved = sum_window(scope, "resolved", window_minutes)
-    successes = sum_window(scope, "succ", window_minutes)
-    rate = _rate(resolved, successes)
-    return rate, (resolved if rate is not None else 0.0)
-
-
 # ============================================================
 # PRIMITIVE 2: last-event-minute tracking
+# (written by record_transaction_outcome())
 # ============================================================
-
-def mark_route_flagged_down(route_id: str) -> None:
-    get_redis_client().set(f"route:{route_id}:last_flagged_minute", current_minute())
-
-
-def mark_bank_route_success(bank: str, route_id: str) -> None:
-    get_redis_client().set(f"bankroute:{bank}:{route_id}:last_success_minute", current_minute())
-
 
 def _minutes_since(stored_minute, now: int) -> float:
     if stored_minute is None:
@@ -268,18 +260,13 @@ def _minutes_since(stored_minute, now: int) -> float:
 
 # ============================================================
 # PRIMITIVE 3: cumulative running average (bank amount baseline)
+# (written by record_routing_decision())
 # ============================================================
 
 def _bank_avg(total, count) -> float | None:
     if total is None or count is None or float(count) <= 0:
         return None
     return float(total) / float(count)
-
-
-def record_bank_amount(bank: str, amount: float) -> None:
-    r = get_redis_client()
-    r.incrbyfloat(f"bank:{bank}:amount_sum", amount)
-    r.incr(f"bank:{bank}:amount_count")
 
 
 # ============================================================
@@ -460,41 +447,27 @@ def build_route_features(
 # RECORDING: called ONCE per transaction, never per candidate
 # ============================================================
 
-def record_routing_decision(route_id: str, bank: str, network: str, amount: float) -> None:
-    """Call exactly once, right after argmax picks the winning route."""
-    record_bank_amount(bank, amount)
-
-
-def record_transaction_outcome(
-    route_id: str, bank: str, network: str, success: bool, latency_ms: float,
-) -> None:
-    """Call exactly once, when the real outcome is known (callback/webhook)."""
-    record_outcome(f"route:{route_id}", success, latency_ms)
-    record_outcome(f"bank:{bank}", success, track_active=True)
-    record_outcome(f"network:{network}", success, track_active=True)
-    record_outcome(f"bankroute:{bank}:{route_id}", success)
-
-    if success:
-        mark_bank_route_success(bank, route_id)
-    else:
-        success_rate_5m, _ = get_rolling_rate(f"route:{route_id}", WINDOW_5M)
-        if success_rate_5m is not None and success_rate_5m < FLAG_DOWN_THRESHOLD:
-            mark_route_flagged_down(route_id)
-
-
 PENDING_TTL_SECONDS = 3600
 
 
-def record_pending_route(
-    transaction_id: str, route_id: str, bank: str, network: str, predicted_probability: float
+def record_routing_decision(
+    transaction_id: str, route_id: str, bank: str, network: str, amount: float,
+    predicted_probability: float,
 ) -> None:
+    """
+    Call exactly once, right after argmax picks the winning route. Updates the
+    bank's running amount average and stores the pending decision for /outcome,
+    in one round trip.
+    """
     # predicted_probability travels with the pending decision so /outcome can
     # compare what the model expected with what actually happened (calibration
     # monitoring). It is one more field in the same HSET, not an extra call.
-    r = get_redis_client()
-    key = f"pending:{transaction_id}"
-    r.hset(
-        key,
+    pending_key = f"pending:{transaction_id}"
+    pipe = get_redis_client().pipeline(transaction=False)
+    pipe.incrbyfloat(f"bank:{bank}:amount_sum", amount)
+    pipe.incr(f"bank:{bank}:amount_count")
+    pipe.hset(
+        pending_key,
         mapping={
             "route_id": route_id,
             "bank": bank,
@@ -502,14 +475,53 @@ def record_pending_route(
             "predicted_probability": predicted_probability,
         },
     )
-    r.expire(key, PENDING_TTL_SECONDS)
+    pipe.expire(pending_key, PENDING_TTL_SECONDS)
+    pipe.execute()
 
 
 def pop_pending_route(transaction_id: str) -> dict | None:
-    r = get_redis_client()
+    """
+    Read and delete the pending decision in one round trip. MULTI/EXEC makes
+    the read-and-delete atomic, so two concurrent reports of the same outcome
+    can't both get the decision (one round trip either way).
+    """
     key = f"pending:{transaction_id}"
-    pending = r.hgetall(key)
-    if not pending:
-        return None
-    r.delete(key)
-    return pending
+    pipe = get_redis_client().pipeline(transaction=True)
+    pipe.hgetall(key)
+    pipe.delete(key)
+    pending, _ = pipe.execute()
+    return pending or None
+
+
+def record_transaction_outcome(
+    route_id: str, bank: str, network: str, success: bool, latency_ms: float,
+) -> None:
+    """
+    Call exactly once, when the real outcome is known (callback/webhook).
+
+    One round trip for every counter. On a failure the same trip also reads
+    the route's 5-minute success rate: the window covers completed minutes
+    only, so the writes to the current minute can't change what it reads. A
+    second trip happens only when that rate crosses the flag-down threshold.
+    """
+    minute = current_minute()
+    route_scope = f"route:{route_id}"
+
+    pipe = get_redis_client().pipeline(transaction=False)
+    _queue_outcome(pipe, route_scope, minute, success, latency_ms)
+    _queue_outcome(pipe, f"bank:{bank}", minute, success, track_active=True)
+    _queue_outcome(pipe, f"network:{network}", minute, success, track_active=True)
+    _queue_outcome(pipe, f"bankroute:{bank}:{route_id}", minute, success)
+
+    if success:
+        pipe.set(f"bankroute:{bank}:{route_id}:last_success_minute", minute)
+        pipe.execute()
+        return
+
+    pipe.mget(_window_keys(route_scope, "resolved", WINDOW_5M, minute))
+    pipe.mget(_window_keys(route_scope, "succ", WINDOW_5M, minute))
+    *_, resolved_5m, succ_5m = pipe.execute()
+
+    success_rate_5m = _rate(_sum_values(resolved_5m), _sum_values(succ_5m))
+    if success_rate_5m is not None and success_rate_5m < FLAG_DOWN_THRESHOLD:
+        get_redis_client().set(f"route:{route_id}:last_flagged_minute", minute)
