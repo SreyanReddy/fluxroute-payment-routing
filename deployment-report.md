@@ -734,6 +734,10 @@ per request, and it will grow under concurrency as Redis queues requests.
 large multiple.** LightGBM scoring four rows is genuinely fast — likely
 sub-millisecond.
 
+> **Outcome (Part 9):** half right. Fetch does dominate, but Redis sat at 39%
+> CPU, so the cost was GIL contention around the round-trips in the app, not
+> Redis itself. Scoring was 24 ms at p99, not sub-millisecond.
+
 ### 8.2 Why this is good news, not a problem
 
 If that's what the data shows, you have:
@@ -766,15 +770,262 @@ That is your direct evidence the Part 1 fix worked.
 
 ---
 
-## Part 9 — What Is Still Not Done
+## Part 9 — The Baseline Run (Measured)
+
+Part 8 was a prediction. This part is what actually happened when the stack ran
+under load. The prediction turned out to be half right: feature fetch does
+dominate, but the reason is not the one Part 8 gave.
+
+### 9.1 Setup and procedure
+
+| | |
+|---|---|
+| Code | commit `7a7d06f` |
+| Host | ASUS Vivobook K6502VU, 16 logical cores, 15.2 GiB RAM, Zorin OS 17 (Ubuntu 22.04 base) |
+| Runtime | Docker 29.9.0, Compose v5.6.0 |
+| Stack | 3 app replicas × 1 uvicorn worker, nginx `least_conn`, Redis 7, Prometheus, Grafana |
+| Load generator | Locust 2.32.4, same host as the stack |
+| `TRAFFIC_SCALE` | 800 (compose default) |
+
+Everything shares one laptop, so these numbers describe this machine, not a
+production deployment. What carries over is the shape of the curve and the
+diagnosis, not the absolute req/s.
+
+The procedure, used for this run and to be repeated unchanged for every
+after-run:
+
+1. `redis-cli FLUSHALL` to start from a known state.
+2. Warm up for 2 minutes at 50 users, without recording (see 8.3).
+3. Sweep 10 → 25 → 50 → 100 users, 3 minutes each, back to back, without
+   flushing between levels:
+   ```bash
+   locust -f loadtest/locustfile.py --host http://localhost:8080 --headless \
+       -u <N> -r <min(N,25)> -t 3m --csv loadtest/baseline_u<N> --only-summary
+   ```
+4. Afterwards, evaluate the server-side Prometheus p99s **at each level's end
+   time** (taken from Locust's shutdown log line) with a `[2m]` window, so the
+   window covers the steady-state last 2 minutes and excludes ramp-up:
+   ```bash
+   curl -s localhost:9090/api/v1/query \
+       --data-urlencode 'query=histogram_quantile(0.99, sum by (le) (rate(fluxroute_feature_fetch_seconds_bucket[2m])))' \
+       --data-urlencode "time=$(date -d '2026-10-13 22:09:05' +%s)"
+   ```
+
+Step 4 is deliberate. The first attempt queried Prometheus by hand in the
+browser between levels. Under time pressure, one query was pasted twice, which
+made fetch and scoring p99 look identical at two load levels. Evaluating at
+recorded timestamps after the fact removes that whole class of mistake.
+
+Raw Locust output is in `loadtest/baseline_u{10,25,50,100}_stats.csv`.
+
+### 9.2 Pre-flight checks
+
+**An earlier run was discarded.** `loadtest/run1_*.csv`, recorded before the
+stack existed in Docker, showed 53,631 requests at ~2 ms with **100%
+failures**. That is the signature of nothing listening on the port. It
+measured connection refusals, not the service, so it was deleted. The fix is
+procedural: always smoke-test one `/route` call and confirm a 200 before
+applying load.
+
+**Warm-up works, and the model learns live.** The same request before and
+after warm-up:
+
+| Route | Simulator base success rate | Cold (empty Redis) | Warm (after 2 min) |
+|---|---|---|---|
+| R1 | 0.986 (best) | 0.9803 | **0.9790** (chosen) |
+| R2 | 0.981 | 0.9790 | 0.9749 |
+| R3 | 0.979 (worst) | 0.9790 | **0.9396** |
+| R4 | 0.983 | 0.9803 | 0.9789 |
+
+Cold, every route falls back to the same static defaults, so the candidates tie
+exactly (R1 = R4, R2 = R3). The ties are exact rather than merely close because
+isotonic calibration is a step function: slightly different raw scores land on
+the same plateau. The service ranks on raw scores (2.4), which is why it can
+still pick a winner among calibrated ties. Warm, the ordering recovers the
+simulator's true ranking, best and worst at the ends, purely from outcomes
+reported through `/outcome`. This is the live evidence that the Part 1 fix and
+the feedback loop work.
+
+**Load balancing is even under concurrent load.** Request counts per replica
+after warm-up: app1 5,941 / app2 5,961 / app3 6,009, a spread of 1.2%.
+
+A misleading first check is worth recording. Thirteen sequential `curl`s all
+landed on app1 (13 / 0 / 0). That is not a balancing bug. nginx runs one worker
+per core (`worker_processes auto`, 16 here), and each worker keeps its own
+`least_conn` state. With sequential requests every backend has 0 active
+connections, so every worker breaks the tie the same way, by picking the first
+server. Only concurrent load creates the connection-count differences that
+`least_conn` acts on.
+
+**The procedure is reproducible.** Two separate 2-minute warm-ups at 50 users
+gave 149.1 and 144.7 `/route` req/s, both with a 160 ms median. Two separate u10
+runs gave 59.4 and 59.6 req/s with a 31 ms median. Locust never raised its
+CPU-usage warning, so the load generator was not the limit.
+
+### 9.3 Results
+
+End-to-end, from Locust (client side, the source of truth for latency):
+
+| Users | `/route` req/s | p50 | p95 | p99 | `/outcome` p50 | Failures |
+|---|---|---|---|---|---|---|
+| 10 | 59.6 | 31 ms | 58 ms | 76 ms | 7 ms | 0 |
+| 25 | 128.4 | 51 ms | 96 ms | 130 ms | 13 ms | 0 |
+| 50 | **136.9** | 180 ms | 260 ms | 320 ms | 53 ms | 0 |
+| 100 | 125.9 | 500 ms | 660 ms | 770 ms | 160 ms | 0 |
+
+Server-side p99, from Prometheus, evaluated at each level's end time:
+
+| Users | `/route` handler | feature fetch | scoring |
+|---|---|---|---|
+| 10 | 70 ms | 49 ms | 24 ms |
+| 25 | 177 ms* | 98 ms | 24 ms |
+| 50 | 422 ms* | 249 ms | 43 ms |
+| 100 | 984 ms* | **≥ 250 ms** (top bucket) | 89 ms |
+
+\* *Higher than the client-side p99, which is impossible in reality.* These are
+bucket-interpolation artifacts: `histogram_quantile` assumes observations are
+spread evenly inside a bucket, and the route histogram jumps 100 → 250 → 500 →
+1000 ms, so estimates inside those wide buckets overshoot. Use Locust for
+end-to-end latency, and use the server-side numbers only to compare fetch
+against scoring.
+
+The fetch histogram's highest finite bucket is 250 ms, so at u100 it can only
+report "at least 250 ms". Adding `0.5, 1.0` to `FEATURE_FETCH_LATENCY`'s buckets
+fixes this for later runs without changing any reading below 250 ms.
+
+### 9.4 Reading the throughput curve
+
+Locust is a **closed loop**: each simulated user waits for a response before
+sending its next request. One user's cycle is
+
+```
+/route latency + /outcome latency + think time (between(0.05, 0.2), mean 125 ms)
+```
+
+so N users can produce at most N ÷ cycle time. At u10 that predicts
+10 ÷ (34 + 8 + 125 ms) ≈ 60 req/s, and the measured value was 59.6. At low load
+the users' own pacing limits throughput, not the service.
+
+The curve has three regions:
+
+- **10 → 25 users:** throughput more than doubles (59.6 → 128.4). The service
+  still has headroom.
+- **25 → 50 users:** throughput gains only 7% while p50 rises 3.5×. This is the
+  knee. **The ceiling is about 137 `/route` req/s** (about 274 req/s including
+  `/outcome`).
+- **50 → 100 users:** throughput **falls** 8% while p99 more than doubles. This
+  is *retrograde scaling*: extra concurrency does not just queue, it makes the
+  system less efficient. Some shared resource is being fought over, and the
+  fight costs more than it delivers.
+
+Little's Law (1.3) puts the in-flight count at saturation at roughly
+149 req/s × 0.155 s ≈ 23 concurrent `/route` requests across three replicas.
+`/outcome`, which only increments a few counters, rose from 7 ms to 160 ms
+median. It does almost no work, so that time is queueing behind `/route`.
+
+### 9.5 Resource utilization at saturation
+
+`docker stats` snapshot during a 50-user run:
+
+| Container | CPU (100% = one core) | Threads (PIDS) |
+|---|---|---|
+| app1 / app2 / app3 | **131–136% each** | 290–338 each |
+| redis | 39% | 6 |
+| nginx | 5% | 17 |
+| prometheus / grafana | < 1% | — |
+
+In total that's about 4.4 of 16 cores. **The host is not saturated, and neither
+is Redis.** Redis is single-threaded, so it would be pinned near 100% if it were
+the limit. It is idle more than half the time.
+
+### 9.6 Diagnosis
+
+**What Part 8 got right:** feature fetch dominates. Fetch p99 grows 49 → 98 →
+249 → ≥250 ms with load, while scoring stays flat at 24 ms until saturation.
+
+**What Part 8 got wrong:** the mechanism. Part 8 attributed fetch time to Redis
+round-trip latency queueing inside Redis. The data rules that out: Redis is at
+39% CPU. The time is spent on the app side of each round-trip.
+
+**The most consistent explanation is GIL contention inside each replica.**
+
+- `/route` and `/outcome` are plain `def` handlers, not `async def`, so FastAPI
+  runs them in a thread pool. Many requests run concurrently **inside one Python
+  process**.
+- Python's GIL lets only one thread execute Python code at a time. Each replica
+  is therefore capped at about one core of Python work. The ~130% CPU is that
+  one core plus work done outside the GIL (C extensions, socket I/O).
+- Each of the ~80 Redis calls in a fetch releases the GIL to wait on the
+  socket, gets its reply in about 0.1 ms, and then **waits to re-acquire the
+  GIL** behind every other runnable request thread. That handoff happens about
+  80 times per request, and each wait grows with the number of threads. So
+  fetch time scales with concurrency even though Redis itself is fast.
+- More concurrency means more threads, more handoffs and more context
+  switching. That accounts for the retrograde drop at u100.
+
+At saturation, the 3 replicas served ~137 `/route` + ~137 `/outcome` req/s on
+about 3 cores of Python. That works out to **roughly 20 ms of single-core Python
+CPU per route+outcome cycle**, and that number is what any efficiency fix has
+to reduce.
+
+**Second finding: scoring is not sub-millisecond.** Part 8 predicted scoring
+"likely sub-millisecond". It is 24 ms at p99 even at low load. A prime suspect
+is **OpenMP thread oversubscription**. LightGBM's `predict` starts an OpenMP
+team sized to the core count (16) **per calling thread**, so a thread pool of
+request threads can create hundreds of OpenMP threads per process. That matches
+the ~300 PIDS per app container: roughly 900 threads competing for 16 cores, to
+score 4 rows each. Pandas overhead on tiny DataFrames (the `DataFrame` build,
+column selection and the sklearn preprocessor) likely contributes too.
+*Status: hypothesis.* The next check is comparing PIDS at idle with PIDS under
+load. Setting `OMP_NUM_THREADS=1` is the experiment that confirms or rules it
+out.
+
+### 9.7 Traffic-meter clamping
+
+`read_system_tps()` clamps whenever the last 60 seconds averaged under
+`SYSTEM_TPS_MIN ÷ TRAFFIC_SCALE` ≈ 8,458 ÷ 800 ≈ **10 `/route` req/s**.
+
+- **Steady state never clamps.** 60–137 req/s scales to about 48k–110k, inside
+  the training range of 8,458–308,555.
+- **No `high` clamps at any level,** so `TRAFFIC_SCALE=800` fits this load
+  range.
+- **`low` clamps: 1,331** over the 16 minutes ending at u100's end. These are
+  cold starts after idle gaps (u10-rerun after a 2.7-minute gap, u25 after a
+  2-minute gap). Each needs about 600 requests (10 req/s × 60 s) before the
+  window average recovers, which is consistent with the total. Levels started
+  within 17–34 s of the previous one still had a full window, so they should not
+  have clamped.
+
+That is about 1.5% of requests, all in the first seconds of a run, and outside
+the `[2m]` windows used for the server-side numbers. It does not affect the
+baseline.
+
+### 9.8 The plan for the throughput loop
+
+The bottleneck is **Python CPU per replica, made worse by contention**, not
+Redis capacity. Candidate changes, roughly by effort:
+
+| | Change | Why it should help |
+|---|---|---|
+| A | Remove the ~8 Redis writes per request that feed counters nothing reads | Fewer commands means less CPU and fewer GIL handoffs per request |
+| B | `OMP_NUM_THREADS=1` for the app containers | Removes the suspected OpenMP oversubscription in scoring (tests 9.6's hypothesis) |
+| C | Redis pipelining in `build_route_features()` | ~80 GIL handoffs become ~1 per request. Expected to be the largest single gain |
+| D | More replicas | 12 of 16 cores and over half of Redis are idle. This adds capacity rather than efficiency, so it goes last, where it can't hide inefficiency |
+
+**One change per experiment**, each measured with the identical procedure from
+9.1, so every gain is attributable to one cause. Each experiment gets its own
+commit and its own `loadtest/<name>_u<N>_stats.csv` files.
+
+---
+
+## Part 10 — What Is Still Not Done
 
 Stated plainly so nothing in the repo overstates itself:
 
-1. **No load-test run has been recorded.** The harness and the full stack exist
-   and are runnable; the numbers do not exist until you run them. The README
-   says exactly this, with a placeholder where they'll go.
-2. **Redis pipelining** — see Part 8. Deliberately deferred until after
-   baseline measurement.
+1. **Only the baseline has been measured.** Part 9 records it. The README
+   section still has a placeholder for the summary.
+2. **Redis pipelining** — now backed by measurement (9.6), and step C of the
+   throughput plan (9.8).
 3. **CacheX swap-in** — separate repo, not started. The feature-fetch vs.
    scoring latency split exists specifically so this comparison is measurable
    when it happens.
@@ -794,7 +1045,7 @@ Stated plainly so nothing in the repo overstates itself:
 
 ---
 
-## Part 10 — Explaining This Out Loud
+## Part 11 — Explaining This Out Loud
 
 Compressed answers for the questions most likely to come up.
 
@@ -834,8 +1085,20 @@ Grafana route-distribution panel shows whether decisions are actually spread
 across routes rather than collapsing onto one, and the observed success rate
 panel tracks real outcomes.
 
+**"What did the load test show?"**
+Three replicas on a 16-core laptop topped out at about 137 routing decisions
+per second, with throughput actually falling at higher concurrency. I'd
+predicted Redis round-trips would be the bottleneck, but `docker stats` showed
+Redis at 39% CPU while each app replica sat at about 130%. Each replica is one
+Python process running its handlers in a thread pool, so the ~80 Redis calls
+per request each have to re-acquire the GIL behind every other request thread.
+The cost was contention in the app, not Redis. Scoring was also 24 ms instead of
+the sub-millisecond I expected, and about 300 threads per container point to
+LightGBM's OpenMP oversubscribing the cores.
+
 **"What would you do next?"**
-Measure, then pipeline the Redis reads — roughly 80 sequential round-trips per
-request is almost certainly the p99 bottleneck, and batching them into one
-round-trip is the obvious fix. After that, swap Redis for the C++ cache I'm
-building and re-run the identical load test to measure the difference.
+Work through the measured bottleneck one change at a time, re-running the
+identical sweep after each: remove dead Redis writes, pin OpenMP to one thread,
+then pipeline the Redis reads so ~80 GIL handoffs become one. Only then add
+replicas. After that, swap Redis for the C++ cache I'm building and re-run the
+identical load test to measure the difference.
