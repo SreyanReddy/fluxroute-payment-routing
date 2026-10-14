@@ -1439,7 +1439,7 @@ git commit -m "Load test: ${RUN}"
 ```
 
 Locust's `_stats_history.csv`, `_failures.csv` and `_exceptions.csv` files are
-left uncommitted. The history file is large, and the other two are empty when
+git-ignored. The history file is large, and the other two are empty when
 the run is clean (and if they aren't, the run isn't valid anyway).
 
 ### A.7 Experiment discipline

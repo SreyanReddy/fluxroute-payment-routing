@@ -38,3 +38,8 @@ dataset-generator-routing/*.csv
 tests/parity/.cache/
 
 .venv-load/
+
+# Locust by-products: only *_stats.csv and *_endtimes.txt are kept per run
+loadtest/*_exceptions.csv
+loadtest/*_failures.csv
+loadtest/*_stats_history.csv
