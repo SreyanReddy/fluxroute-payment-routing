@@ -1090,8 +1090,8 @@ saturation, fetch is about **90%** of the route p99 (270 of 295 ms at u50).
   u50. FastAPI's thread pool is capped at 40, so it cannot produce 578 threads
   on its own. One 16-thread OpenMP team per request thread that has called
   `predict` fits the numbers. Across 3 replicas at u100, that's ~1,700 threads on
-  16 cores. Experiment B (`OMP_NUM_THREADS=1`) should keep thread counts near
-  51 + the thread pool size under any load.
+  16 cores. (Experiment B tested this with `OMP_NUM_THREADS=1` and found that
+  the environment variable doesn't reach the predict path. See 9.11.)
 - **Redis peaks at 46%.** It has not been the bottleneck at any load level.
 
 **Clamping:** `increase(...[13m])` over the sweep is **0**. With the sweep
@@ -1168,6 +1168,56 @@ remove Python work that isn't part of a round-trip.
 
 The change is kept regardless: it is correct, it reduces Redis load, and parity
 shows the model's inputs are unchanged.
+
+### 9.11 Experiment B — `OMP_NUM_THREADS=1` (`expB_omp`)
+
+**Change:** `OMP_NUM_THREADS=1` added to the image's `ENV` block in
+`serving/Dockerfile`, to cap OpenMP at one thread per process.
+
+**Prediction:** if the load-driven threads in 9.9 were OpenMP teams, thread
+counts under load should stay near the idle count plus the thread pool (≤ 40),
+instead of reaching ~578, and scoring should get cheaper.
+
+| Users | req/s | p50 | p99 | expA (req/s / p50 / p99) |
+|---|---|---|---|---|
+| 10 | 61.7 | 27 ms | 63 ms | 61.4 / 27 / 66 |
+| 25 | 132.4 | 46 ms | 110 ms | 132.1 / 46 / 110 |
+| 50 | 140.0 | 170 ms | 280 ms | 141.1 / 170 / 270 |
+| 100 | 129.3 | 470 ms | 670 ms | 129.0 / 470 / 670 |
+
+Scoring p99 was unchanged (15 / 18 / 43 / 88 ms), as were fetch p99, app CPU
+(~130% at saturation) and Redis CPU.
+
+| Users | App threads, expA | App threads, expB | Load-created (minus idle), expA → expB |
+|---|---|---|---|
+| idle | 51 | **6** | |
+| 10 | 114 | 53–69 | 63 → 47–63 |
+| 25 | 162–178 | 117 | 111–127 → 111 |
+| 50 | 274–306 | 261–277 | 223–255 → 255–271 |
+| 100 | 562–578 | 517–533 | 511–527 → 511–527 |
+
+**Result: no performance change, and the prediction failed in an informative
+way.** The environment variable removed 45 *idle* threads: the thread pools that
+OpenMP and numpy's OpenBLAS create at import. The threads created *by load*
+were identical, about 527 at u100 in both runs, still growing by about 16 per
+concurrent request.
+
+**Why:** the model was trained with `LGBMClassifier(n_jobs=-1)`
+(`ml/lightgbm_tuned.py:706`), and that parameter is pickled with the estimator.
+On every `predict_proba`, LightGBM's sklearn wrapper resolves `n_jobs=-1` to
+the CPU count (16) and passes it to the booster as an **explicit**
+`num_threads`. An explicit thread count overrides `OMP_NUM_THREADS`, which only
+sets OpenMP's *default*. So experiment B never reached the code path it was
+meant to change. The OpenMP-teams hypothesis from 9.6 is therefore **untested,
+not refuted**. The ×16-per-request-thread scaling still fits it exactly.
+
+The lesson: a training-time parallelism setting silently became a serving-time
+setting. `n_jobs=-1` is right for training on a big batch and wrong for scoring
+4 rows from dozens of concurrent request threads.
+
+`OMP_NUM_THREADS=1` stays in the image. It is harmless, removes 45 idle threads
+per replica, and keeps numpy's thread pool from oversubscribing once scoring is
+single-threaded. The actual fix is experiment B2.
 
 ---
 
