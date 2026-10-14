@@ -1022,7 +1022,7 @@ Redis capacity. Candidate changes, roughly by effort:
 | A | Remove the ~8 Redis writes per request that feed counters nothing reads | Fewer commands means less CPU and fewer GIL handoffs per request |
 | B | `OMP_NUM_THREADS=1` for the app containers | Removes the suspected OpenMP oversubscription in scoring (tests 9.6's hypothesis) |
 | C | Redis pipelining in `build_route_features()` | ~80 GIL handoffs become ~1 per request. Expected to be the largest single gain |
-| D | More replicas | 12 of 16 cores and over half of Redis are idle. This adds capacity rather than efficiency, so it goes last, where it can't hide inefficiency |
+| D | More replicas | 12 of 16 cores and over half of Redis are idle. This adds capacity rather than efficiency, so it goes last, where it can't hide inefficiency. **Dropped in 9.14:** the goal became CPU per transaction, which replicas don't change |
 
 **One change per experiment**, each measured with the identical procedure from
 9.1, so every gain is attributable to one cause. Each experiment gets its own
@@ -1272,6 +1272,155 @@ confirmed.**
 - **Fetch is now ~94% of route p99 at saturation** (272 of 289 ms at u50). It is
   the dominant cost by far, which makes pipelining (C) the next target.
 
+### 9.13 Experiment C — pipelined feature reads (`expC_pipeline`)
+
+**Change:** `build_route_features()` now queues its reads on a Redis pipeline
+(`transaction=False`) and sends them in **2 round trips per candidate route
+instead of ~20** (about 8 instead of ~80 per request). The first trip carries
+every independent read. The second carries the bank and network active-minute
+counters, which can only be read once the first trip has returned which minutes
+were active. The command set is unchanged: same 16 + 4 commands, same keys, same
+summation order. Only the number of round trips changed. The read helpers were
+split into pure key builders and pure math functions, and a single `now` is used
+for every key in a call.
+
+**Verification before measuring:** the parity test was unchanged (22 pass, 4
+known gaps, 0 fail of 26 features). The function signature is unchanged, so the
+parity adapter ran against the new code without modification.
+
+**Prediction:** experiment A removed 8 round trips for about +1.6%. Scaling
+linearly, removing ~72 suggested +10–15%.
+
+| Users | req/s | p50 | p95 | p99 | expB2 (req/s / p50 / p99) | Δ req/s vs B2 | Δ req/s vs baseline2 |
+|---|---|---|---|---|---|---|---|
+| 10 | 64.2 | 21 ms | 37 ms | 44 ms | 61.6 / 27 / 62 | +4.2% | +4.6% |
+| 25 | 144.0 | 27 ms | 55 ms | 72 ms | 134.8 / 44 / 99 | +6.8% | +10.0% |
+| 50 | **171.5** | 92 ms | 160 ms | 200 ms | 145.4 / 160 / 260 | **+18.0%** | **+23.5%** |
+| 100 | **177.4** | 290 ms | 430 ms | 480 ms | 134.8 / 450 / 630 | **+31.6%** | **+39.8%** |
+
+(The u10 gain is not extra capacity. At u10 throughput is think-time bound, so
+a shorter request means a shorter cycle and more cycles per user.)
+
+| Users | fetch p99, B2 → C | scoring p99 (C) | route p99, server (C) | App CPU (C) | App threads (C) | Redis CPU, B2 → C |
+|---|---|---|---|---|---|---|
+| idle | | | | ~0% | 6 | 5% → 1% |
+| 10 | 48 → **24 ms** | 15 ms | 47 ms | 38–45% | 8–9 | 16% → 10% |
+| 25 | 96 → **46 ms** | 18 ms | 63 ms | 88–97% | 12 | 31% → 23% |
+| 50 | 272 → **113 ms** | 39 ms | 149 ms | 110–116% | 23 | 39% → 25% |
+| 100 | ~500–700 → **290 ms** | 87 ms | 448 ms | ~120% | 40 | 39% → 25% |
+
+There was one failure (at u25) in about 105,000 `/route` requests, the same
+rate as the keepalive-race 502 in 9.9.
+
+**Result: the largest gain so far, beyond the prediction.**
+
+- **Fetch p99 fell 51–59%** at every load level.
+- **The retrograde scaling is gone.** From u50 to u100, throughput now *rises*
+  (171.5 → 177.4) instead of falling 7–8% as in every earlier run. The new
+  ceiling is at least ~177 `/route` req/s, about **+28% over `baseline2`'s
+  ~139**. u100 may not be the peak yet. Locating the new knee needs a sweep
+  with higher levels (u150, u200).
+- **Tail latency at u100 fell from 630 to 480 ms p99,** while serving 32% more
+  traffic.
+- **CPU per request fell about 30%.** At u100 each app now uses ~120% CPU (it
+  was ~131%) while serving 32% more requests: ~2.0 versus ~2.9 CPU-% per req/s
+  across the 3 replicas. The single-core ceiling is the same, and far less of
+  it is spent handing the GIL back and forth.
+- **Redis CPU fell about 35%** at saturation while serving more requests. It
+  receives the same commands, but in large batches, so it does far fewer
+  socket reads and writes.
+- **Scoring is unchanged** (15 / 18 / 39 / 87 ms), as expected, since this
+  change only touched fetch.
+
+**Why the linear prediction undershot.** Experiment A measured the effect of
+removing a few round trips from a system that stayed just as congested. The
+cost of one GIL handoff is not fixed: it is the wait behind every other
+runnable thread, and that number grows with how long requests stay in flight.
+Removing ~90% of a request's handoffs makes each request finish sooner, so
+fewer threads are in flight, so every remaining handoff waits less. The effect
+compounds, which is why the gain is largest exactly where contention was worst
+(u100), and why the retrograde scaling disappeared. Contention costs scale
+superlinearly, so removing most of the handoffs gains more than a linear
+extrapolation from removing a few suggests.
+
+**Where the time goes now.** At u50, fetch is ~75% of route p99 (113 of
+149 ms) and scoring ~26%. Counting round trips per route + outcome cycle after
+C:
+
+| Path | Round trips |
+|---|---|
+| `/route` feature reads (4 routes × 2) | ~8 |
+| `/route` other (traffic meter read + ingress write, bank amount, pending record) | ~7 |
+| `/outcome` (pop pending, 4 × `record_outcome`, last-success mark) | **~27** |
+
+**About two-thirds of the remaining round trips are in `/outcome`.** Those
+writes share each replica's GIL with `/route`, so they are the natural next
+target (experiment C2). They are all writes with no dependencies between them
+(except the rare failure path, which reads the 5-minute rate), so they can be
+pipelined into one or two trips.
+
+### 9.14 Roadmap — maximizing throughput per core
+
+**Goal change.** Experiment D (more replicas) is **dropped**. Adding replicas
+buys capacity, but it doesn't make anything cheaper. The target from here on is
+**CPU per transaction**, because that number turns directly into core counts at
+any scale. At experiment C it is about **20 ms of app CPU per transaction** (≈ 49
+transactions per core per second). A projection to 250k TPS puts the current
+design at ~8,500 cores, and the Redis key design can't reach that rate at all
+because of hot keys. An optimized Python design needs roughly 420–830 cores.
+
+**Primary metric for every experiment from now on:** app CPU-ms per
+transaction (Appendix A.5), alongside the usual throughput and p99. A change
+that keeps throughput flat but lowers CPU per transaction is a win, because it
+frees capacity that a sweep on one laptop can't show.
+
+#### C2 — pipeline the writes (next)
+
+**Change:** batch every write path into the fewest round trips, keeping the
+commands themselves unchanged.
+
+| Path | Now | After C2 |
+|---|---|---|
+| `/outcome`: `pop_pending_route` (`HGETALL` + `DEL`), 4 × `record_outcome` (`ZADD`/`ZREMRANGEBYSCORE`/`INCR`/`EXPIRE`/`INCRBYFLOAT`), `mark_bank_route_success` | ~27 | **2** (the pending record must be read before its route, bank and network are known) |
+| `/route` before scoring: `read_system_tps` (`MGET`) + `record_ingress` (`INCR` + `EXPIRE`) | 3 | 1 |
+| `/route` after the decision: `record_bank_amount` + `record_pending_route` | 4 | 1 |
+| `/outcome` failure path: `get_rolling_rate` 5m (~2% of outcomes) | 2 | 2 (unchanged; it depends on the writes having happened) |
+
+That brings a route + outcome cycle from ~42 round trips to ~12.
+
+**Verification: the parity test does not cover this.** Its adapter seeds Redis
+directly and never calls the write functions. C2 needs a **write-equivalence
+test**: keep a frozen copy of the current write functions as a referee, replay
+the same sequence of route decisions and outcomes (successes, failures, several
+banks, networks and minutes, including the flag-down threshold) against two
+fakeredis instances, one per implementation, and compare every key's type,
+value and TTL (TTL within a second). This is the write-side counterpart of
+`tests/parity/`.
+
+**Expected:** fewer GIL handoffs on a path that runs once per transaction.
+After C's superlinear result, a clear drop in CPU per transaction and a gain at
+u100. With fetch still ~8 round trips, though, expect less than C.
+
+#### The Python optimization queue (after C2)
+
+One experiment per row, measured with the same runbook. The order is
+provisional: **E0 runs first and reorders the rest by measured cost.**
+
+| # | Change | What it removes | Verification | Risk / subtlety |
+|---|---|---|---|---|
+| **E0** | **Profile first:** `py-spy record` against one app process under u50 load, as a flame graph | Nothing. It measures where the ~20 ms goes (fetch, pandas, preprocessor, pydantic, metrics, logging, framework) | n/a | Needs root on the host, or `SYS_PTRACE` in the container |
+| **E1** | **Per-minute in-process feature cache.** Window features (route, bank, network, bank×route) and active-minute lists, read once per replica per minute | Feature reads go from ~8 round trips per request to ~0 on average (~100 commands per replica per *minute*) | Parity test, with the adapter clearing the cache between transactions (otherwise one replayed history leaks into the next at the same minute) | **This is exact, not approximate.** Every window excludes the current minute, the active-minute query stops at `now - 1`, and `record_outcome()` only writes the current minute, so a past minute never changes. One caveat: replica clock skew can land a write in a minute another replica has already cached, so refresh once shortly after each minute boundary |
+| **E2** | **Cache fast-changing values for ~1 s:** `last_flagged_minute`, `last_success_minute`, bank amount sum and count, traffic meter | The remaining per-request reads | Parity (unchanged, since the clock is frozen there) plus a documented staleness bound | **Approximate.** The `time_since_*` values are minute-granular, so 1 s staleness changes them only within 1 s of a boundary. The bank average drifts negligibly |
+| **E3** | **Score without pandas:** build the 4 × 33 feature matrix directly in numpy and apply the preprocessor's transform by hand (or call the fitted encoders on arrays) | DataFrame construction, column selection, ColumnTransformer overhead. Likely most of the 15 ms scoring floor | **Score-parity test:** old vs new pipeline on a sample of real feature rows. Raw probabilities bit-identical, chosen route identical | Category encoding must match the fitted preprocessor exactly, including unknown categories |
+| **E4** | **Compiled tree inference** (treelite or lleaves) | LightGBM's Python/C-API overhead per call | Score-parity with a tolerance (about 1e-9) **plus identical chosen route and calibrated probability** on the sample | Last-bit float differences can push a raw score across an **isotonic step boundary**, changing the calibrated value. That has to be checked explicitly |
+| **E5** | **Write aggregation in each replica:** count in memory, flush `INCRBY`/`INCRBYFLOAT`/`ZADD` batches every ~1 s | Most of the per-transaction write round trips left after C2 | Write-equivalence after a flush (state matches the unaggregated writes) | Buckets finish up to ~1 s late, which **interacts with E1**: the post-boundary refresh must come after the flush. A crashed replica loses up to ~1 s of counts |
+| **E6** | **Stateless pending token:** `/route` returns an HMAC-signed token carrying route, bank, network and probability, and `/outcome` takes the token instead of the Redis lookup | `HSET`/`EXPIRE` + `HGETALL`/`DEL` per transaction | Token round-trip tests, plus tamper and expiry tests | **Loses at-most-once.** Today a duplicate `/outcome` gets a 404 because the pending record is deleted. A stateless token would count it twice unless a dedupe set is added, which brings back some Redis state. The trade-off has to be decided before building it |
+| **E7** | **Concurrency model:** async handlers with `redis.asyncio` instead of a thread pool, *or* several worker processes per container with fewer threads each (gunicorn + Prometheus multiprocess mode) | The thread-pool and GIL handoff overhead that remains | Same runbook. Compare CPU per transaction, not just throughput | Async is a larger refactor. Multi-process needs Prometheus multiprocess mode, or per-process counters break (2.x). Measured as a per-core change, not a scale-out |
+
+Items **not** on the per-core queue: the nginx/uvicorn keepalive 502 fix
+(correctness, done after this loop), and sweep levels beyond u100 (now part of
+the runbook, A.4).
+
 ---
 
 ## Part 10 — What Is Still Not Done
@@ -1419,20 +1568,25 @@ locust -f loadtest/locustfile.py --host http://localhost:8080 --headless \
 Start the sweep **immediately** after the warm-up. A gap of more than 60 s
 empties the traffic meter's window and causes cold-start clamping (9.7).
 
-### A.4 The sweep (about 13 minutes)
+### A.4 The sweep (about 16 minutes)
 
 ```bash
 rm -f loadtest/${RUN}_endtimes.txt
-for u in 10 25 50 100; do
+for u in 10 25 50 100 150; do
   locust -f loadtest/locustfile.py --host http://localhost:8080 --headless \
     -u $u -r $(( u < 25 ? u : 25 )) -t 3m --csv loadtest/${RUN}_u$u --only-summary
   echo "$u $(date +%s)" >> loadtest/${RUN}_endtimes.txt
 done
 ```
 
-The four levels run back to back with no gaps. After each level ends, its user
+The levels run back to back with no gaps. After each level ends, its user
 count and Unix end time are appended to `loadtest/${RUN}_endtimes.txt`, which
 A.5 uses to query Prometheus.
+
+u150 was added from `expC_pipeline` onwards, once u100 stopped being past the
+peak. Earlier runs have u10–u100 only. Their levels compare directly. If Locust
+prints a CPU-usage warning at u150, that level measures the load generator, not
+the service, and has to be discarded.
 
 Optional, in a second terminal during the u50 level (minutes 3.5–6 of the
 sweep):
@@ -1446,7 +1600,7 @@ docker stats --no-stream
 **Client side (Locust):** req/s, p50, p95, p99 and failures per level:
 
 ```bash
-for u in 10 25 50 100; do
+for u in 10 25 50 100 150; do
   awk -F, -v u=$u '$2=="POST /route" {printf "u%-4s req/s=%6.1f  p50=%4s  p95=%4s  p99=%4s  fails=%s\n", u, $10, $12, $17, $19, $4}' \
     loadtest/${RUN}_u${u}_stats.csv
 done
@@ -1467,14 +1621,27 @@ while read u t; do
 done < loadtest/${RUN}_endtimes.txt
 ```
 
+**App CPU per transaction** (milliseconds of app CPU per routed transaction,
+from 9.14 onwards the primary metric). `process_cpu_seconds_total` is exported
+by `prometheus_client` for every app process:
+
+```bash
+while read u t; do
+  printf 'u%-4s cpu_ms_per_txn ' "$u"
+  curl -s localhost:9090/api/v1/query \
+    --data-urlencode 'query=1000 * sum(rate(process_cpu_seconds_total{job="fluxroute"}[2m])) / sum(rate(fluxroute_route_requests_total{status="ok"}[2m]))' \
+    --data-urlencode "time=$t" | grep -o '"[^"]*"\]'
+done < loadtest/${RUN}_endtimes.txt
+```
+
 **Traffic-meter clamping** over the whole sweep (an empty result means no
-clamping). The 13-minute window covers the ~12-minute sweep plus the end of the
-warm-up, but not the warm-up's cold start, which always clamps right after
-`FLUSHALL`:
+clamping). The 16-minute window covers the ~15-minute five-level sweep plus
+the end of the warm-up, but not the warm-up's cold start, which always clamps
+right after `FLUSHALL`. (Four-level runs used `[13m]`.)
 
 ```bash
 curl -s localhost:9090/api/v1/query \
-  --data-urlencode 'query=sum by (direction) (increase(fluxroute_system_tps_clamped_total[13m]))' \
+  --data-urlencode 'query=sum by (direction) (increase(fluxroute_system_tps_clamped_total[16m]))' \
   --data-urlencode "time=$(tail -1 loadtest/${RUN}_endtimes.txt | cut -d' ' -f2)"
 ```
 
